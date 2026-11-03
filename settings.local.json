@@ -1,0 +1,99 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(claude plugin *)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -V)",
+      "Bash(uv tool *)",
+      "Bash(cli-hub --version)",
+      "Bash(cli-hub --help)",
+      "Bash(cli-hub list *)",
+      "Bash(scutil --get ComputerName)",
+      "Bash(cursor-agent --help)",
+      "Bash(agent --help)",
+      "Bash(cursor-agent *)",
+      "Bash(/Users/wujincheng/pty-bridge-agent/room_wait.sh:*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Users/wujincheng/pty-bridge-agent/hook_recorder.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Users/wujincheng/pty-bridge-agent/hook_recorder.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Users/wujincheng/pty-bridge-agent/hook_recorder.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Users/wujincheng/pty-bridge-agent/hook_recorder.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Users/wujincheng/pty-bridge-agent/hook_recorder.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Users/wujincheng/pty-bridge-agent/hook_recorder.py",
+            "timeout": 5
+          }
+        ],
+        "matcher": ""
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Users/wujincheng/pty-bridge-agent/hook_recorder.py",
+            "timeout": 5
+          }
+        ],
+        "matcher": ""
+      }
+    ]
+  }
+}

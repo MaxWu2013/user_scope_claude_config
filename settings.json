@@ -1,0 +1,208 @@
+{
+  "env": {},
+  "model": "opus",
+  "hooks": {
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/wujincheng/.config/iterm2/cc-status"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/wujincheng/.config/iterm2/cc-status"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I \"$HOME/.claude/skills/wf-refactor-skill-names/scripts/check_skill_name_hook.py\" 2>/dev/null || true",
+            "timeout": 30,
+            "statusMessage": "Checking skill name"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|mcp__mcp-obsidian__obsidian_put_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/validate-vault.py\" --post"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/bin/control-check\""
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/wujincheng/.config/iterm2/cc-status"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/bin/control-check\""
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|mcp__mcp-obsidian__obsidian_(put_content|append_content|patch_content)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/require-cursor-agent.py\"",
+            "onFailure": "block"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|mcp__mcp-obsidian__obsidian_(put_content|append_content|patch_content)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/validate-vault.py\" --pre",
+            "onFailure": "block"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/bin/control-check\"",
+            "onFailure": "continue"
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit|Bash|mcp__mcp-obsidian__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "CLAUDE_ROUTING_SCOPE=all-writes python3 \"$HOME/.claude/hooks/route-tools.py\"",
+            "onFailure": "continue"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/wujincheng/.config/iterm2/cc-status"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/wujincheng/.config/iterm2/cc-status"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/routing-context.py\"",
+            "onFailure": "continue"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/wujincheng/.config/iterm2/cc-status"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/wujincheng/.config/iterm2/cc-status"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/wujincheng/.config/iterm2/cc-status"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/wujincheng/.config/iterm2/cc-status"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/wujincheng/.config/iterm2/cc-status"
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "figma@claude-plugins-official": true,
+    "slack@claude-plugins-official": true
+  },
+  "extraKnownMarketplaces": {
+    "claude-plugins-official": {
+      "source": {
+        "source": "github",
+        "repo": "anthropics/claude-plugins-official"
+      }
+    }
+  },
+  "theme": "dark"
+}

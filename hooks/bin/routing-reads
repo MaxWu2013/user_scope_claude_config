@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Print or switch whether reads are routed in every project."""
+
+import importlib.util
+import os
+import sys
+
+sys.dont_write_bytecode = True
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+_SPEC = importlib.util.spec_from_file_location(
+    "route_tools", os.path.join(_ROOT, "route-tools.py")
+)
+_ROUTE = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(_ROUTE)
+
+
+if __name__ == "__main__":
+    sys.exit(_ROUTE.routing_reads_main(sys.argv))

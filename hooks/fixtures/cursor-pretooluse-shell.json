@@ -1,0 +1,21 @@
+{
+  "conversation_id": "00000000-0000-0000-0000-000000000000",
+  "generation_id": "00000000-0000-0000-0000-000000000000",
+  "model": "grok-4.7",
+  "tool_name": "Shell",
+  "tool_input": {
+    "command": "echo hi > lib/out.dart",
+    "cwd": "",
+    "timeout": 30000
+  },
+  "tool_use_id": "fixture-tool-use-id",
+  "cwd": "",
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "hook_event_name": "preToolUse",
+  "cursor_version": "2026.10.22-27dcf5f",
+  "workspace_roots": [
+    "/workspace"
+  ],
+  "user_email": "user@example.com",
+  "transcript_path": null
+}

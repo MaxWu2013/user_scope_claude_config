@@ -1,0 +1,19 @@
+.DS_Store
+**/.DS_Store
+.last-cleanup
+.last-update-result.json
+.oauth_refresh.lock.owner.tmp.78ee31d6
+
+# Python bytecode / build artefacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+tsc-cache
+
+# Local channel access lists
+channels/
+
+# no need plugins
+plugins/

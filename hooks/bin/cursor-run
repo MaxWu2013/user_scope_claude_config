@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""Run cursor-agent on one spec and report control-plane drift."""
+
+import collections
+import datetime
+import hashlib
+import json
+import os
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+
+sys.dont_write_bytecode = True
+_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from _agent_def import read_agent_definition
+from _control import diff_hashes, hash_control_plane
+from _paths import (
+    accept_run_spec,
+    is_legacy_run_arg,
+    tmp_roots,
+    valid_task_name,
+)
+
+_SUMMARY_LINES = 200
+_DEFAULT_TIMEOUT = 3600
+
+
+def _project() -> str:
+    raw = os.environ.get("CLAUDE_PROJECT_DIR")
+    if raw:
+        return os.path.realpath(raw)
+    return os.path.realpath(os.getcwd())
+
+
+def _emit(payload: dict) -> None:
+    print(json.dumps(payload), flush=True)
+
+
+def _agent_bin() -> str:
+    if "CURSOR_RUN_AGENT_BIN" in os.environ:
+        return os.environ["CURSOR_RUN_AGENT_BIN"]
+    found = shutil.which("cursor-agent")
+    if not found:
+        raise FileNotFoundError("cursor-agent not found")
+    return found
+
+
+def _timeout() -> int:
+    raw = os.environ.get("CURSOR_RUN_TIMEOUT")
+    if raw is None or raw.strip() == "":
+        return _DEFAULT_TIMEOUT
+    return int(raw)
+
+
+def _git_porcelain(proj: str):
+    try:
+        proc = subprocess.run(
+            ["git", "-C", proj, "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def _git_unquote(text: str) -> str:
+    if len(text) < 2 or not text.startswith('"') or not text.endswith('"'):
+        return text
+    inner = text[1:-1]
+    raw = bytearray()
+    index = 0
+    simple = {
+        "n": b"\n",
+        "t": b"\t",
+        "\\": b"\\",
+        '"': b'"',
+        "a": b"\a",
+        "b": b"\b",
+        "f": b"\f",
+        "r": b"\r",
+        "v": b"\v",
+    }
+    while index < len(inner):
+        char = inner[index]
+        if char != "\\":
+            raw.extend(char.encode("utf-8"))
+            index += 1
+            continue
+        index += 1
+        if index >= len(inner):
+            break
+        escaped = inner[index]
+        if escaped in simple:
+            raw.extend(simple[escaped])
+            index += 1
+        elif escaped.isdigit():
+            digits = inner[index:index + 3]
+            if len(digits) == 3 and digits.isdigit():
+                raw.append(int(digits, 8))
+                index += 3
+            else:
+                raw.extend(escaped.encode("utf-8"))
+                index += 1
+        else:
+            raw.extend(escaped.encode("utf-8"))
+            index += 1
+    return raw.decode("utf-8", errors="surrogateescape")
+
+
+def _porcelain_path(line: str):
+    if len(line) < 4:
+        return None
+    body = line[3:]
+    if " -> " in body:
+        body = body.split(" -> ", 1)[1]
+    return _git_unquote(body)
+
+
+def _parse_porcelain(text: str) -> dict:
+    entries = {}
+    for line in text.splitlines():
+        path = _porcelain_path(line)
+        if path:
+            entries[path] = line
+    return entries
+
+
+def _content_hash(proj: str, rel: str):
+    path = os.path.join(proj, rel)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    if stat.S_ISLNK(st.st_mode):
+        return "link:" + os.readlink(path)
+    if stat.S_ISDIR(st.st_mode):
+        return "dir"
+    if not stat.S_ISREG(st.st_mode):
+        return "mode:%s" % oct(stat.S_IMODE(st.st_mode))
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _hash_status(proj: str, text: str) -> dict:
+    return {path: _content_hash(proj, path) for path in _parse_porcelain(text)}
+
+
+def _git_diff_names(proj: str, before: str, after: str):
+    try:
+        proc = subprocess.run(
+            ["git", "-C", proj, "diff", "--name-only", before, after],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    names = []
+    for line in proc.stdout.splitlines():
+        if line:
+            names.append(_git_unquote(line))
+    return names
+
+
+def _files_changed(proj: str, before_text, before_hashes, before_head):
+    """(count, paths) for paths this run changed.
+
+    Counts porcelain entries that appeared, disappeared, or changed content,
+    plus names from `git diff --name-only` when HEAD moved. Each path is
+    counted once. (None, None) when git status, a content hash, or HEAD in
+    a git repo cannot be determined.
+    """
+    if before_text is None or before_hashes is None:
+        return None, None
+    after_text = _git_porcelain(proj)
+    if after_text is None:
+        return None, None
+    after_head = _git_head(proj)
+    if before_head is None or after_head is None:
+        return None, None
+    before_entries = _parse_porcelain(before_text)
+    after_entries = _parse_porcelain(after_text)
+    paths = set()
+    for path in before_entries:
+        if path not in after_entries:
+            paths.add(path)
+    for path, entry in after_entries.items():
+        if before_entries.get(path) != entry:
+            paths.add(path)
+            continue
+        after_hash = _content_hash(proj, path)
+        if before_hashes.get(path) != after_hash:
+            paths.add(path)
+    if before_head != after_head:
+        diff_paths = _git_diff_names(proj, before_head, after_head)
+        if diff_paths is None:
+            return None, None
+        paths.update(diff_paths)
+    ordered = sorted(paths)
+    return len(ordered), ordered
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.wait()
+
+
+def _write_result(path: str, payload: dict) -> None:
+    data = (json.dumps(payload) + "\n").encode("utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.chmod(path, 0o600)
+
+
+def _open_log(path: str):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.chmod(path, 0o600)
+        return os.fdopen(fd, "w", encoding="utf-8", buffering=1)
+    except Exception:
+        os.close(fd)
+        raise
+
+
+class _RunError(Exception):
+    pass
+
+
+def _git_head(proj: str):
+    try:
+        proc = subprocess.run(
+            ["git", "-C", proj, "rev-parse", "--verify", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    head = proc.stdout.strip()
+    return head or None
+
+
+def _ensure_repo_dir(path: str) -> None:
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    else:
+        os.chmod(path, 0o700)
+        return
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise _RunError(f"repo directory: {exc}") from exc
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise _RunError("repo directory is not a real directory")
+    if st.st_uid != os.getuid() or (st.st_mode & 0o022) != 0:
+        raise _RunError("repo directory must be owned by you with no group/other write")
+
+
+def _create_run(proj: str, task: str) -> str:
+    given, resolved = tmp_roots()
+    if not os.path.isdir(resolved):
+        raise _RunError("tmp root is not a directory")
+    repo_name = os.path.basename(os.path.normpath(proj))
+    if repo_name in ("", ".", ".."):
+        raise _RunError("project root has no repo name")
+    repo_dir = os.path.join(given, repo_name)
+    _ensure_repo_dir(repo_dir)
+    run_dir = None
+    ts = None
+    last = None
+    for _attempt in range(5):
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        if ts == last:
+            time.sleep(0.002)
+            ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        last = ts
+        candidate = os.path.join(repo_dir, ts)
+        try:
+            os.mkdir(candidate, 0o700)
+        except FileExistsError:
+            ts = None
+            continue
+        os.chmod(candidate, 0o700)
+        run_dir = candidate
+        break
+    if run_dir is None or ts is None:
+        raise _RunError("could not create a run directory")
+    specs = os.path.join(run_dir, "specs")
+    os.mkdir(specs, 0o700)
+    os.chmod(specs, 0o700)
+    payload = {
+        "project": proj,
+        "repo_name": repo_name,
+        "created": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "task": task,
+        "head": _git_head(proj),
+    }
+    run_json = os.path.join(run_dir, "run.json")
+    fd = os.open(run_json, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY, 0o600)
+    try:
+        os.write(fd, (json.dumps(payload) + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.chmod(run_json, 0o600)
+    return os.path.join(given, repo_name, ts, "specs", task + ".md")
+
+
+def cmd_new(proj: str, task: str) -> int:
+    if not valid_task_name(task):
+        _emit({"status": "bad_input", "error": "invalid task name", "task": task})
+        return 2
+    try:
+        spec = _create_run(proj, task)
+    except _RunError as exc:
+        _emit({"status": "bad_input", "error": str(exc), "task": task})
+        return 2
+    except OSError as exc:
+        _emit({"status": "bad_input", "error": str(exc), "task": task})
+        return 2
+    print(spec, flush=True)
+    return 0
+
+
+def _argv(agent: str, model, permission: str | None, proj: str, spec: str) -> list[str]:
+    prompt = f"Implement the spec in {spec}. Report files touched, tests run and results."
+    argv = [
+        agent,
+        "-p",
+        "--trust",
+        "--model",
+        model if isinstance(model, str) else "",
+        "--workspace",
+        proj,
+        "--output-format",
+        "text",
+        prompt,
+    ]
+    if permission == "yolo":
+        argv.insert(2, "--force")
+    return argv
+
+
+def _finish(result: dict, code: int, result_path: str) -> int:
+    try:
+        _write_result(result_path, result)
+    except Exception as exc:
+        result["report_error"] = str(exc)
+        code = code or 5
+    _emit(result)
+    return code
+
+
+def cmd_run(proj: str, arg: str) -> int:
+    if is_legacy_run_arg(arg, proj):
+        _emit({
+            "status": "bad_input",
+            "error": "legacy .claude/specs paths are rejected; run cursor-run new <task>",
+            "spec": arg,
+        })
+        return 2
+    try:
+        problem = accept_run_spec(arg, proj, require_file=True)
+    except Exception as exc:
+        problem = str(exc)
+    if problem:
+        _emit({"status": "bad_input", "error": problem, "spec": arg})
+        return 2
+
+    spec = os.path.normpath(arg)
+
+    try:
+        before = hash_control_plane(proj)
+    except Exception as exc:
+        _emit({
+            "status": "check_error",
+            "stage": "hash_before",
+            "error": str(exc),
+            "spec": spec,
+        })
+        return 4
+
+    try:
+        model, permission = read_agent_definition()
+    except Exception as exc:
+        _emit({
+            "status": "check_error",
+            "stage": "agent_def",
+            "error": str(exc),
+            "spec": spec,
+        })
+        return 4
+
+    try:
+        timeout = _timeout()
+    except ValueError as exc:
+        _emit({
+            "status": "bad_input",
+            "error": f"CURSOR_RUN_TIMEOUT: {exc}",
+            "spec": spec,
+        })
+        return 2
+
+    stem = spec.removesuffix(".md")
+    log_path = stem + ".log"
+    result_path = stem + ".result.json"
+    result = {
+        "status": "error",
+        "exit_code": None,
+        "control_changed": None,
+        "changed_paths": [],
+        "files_changed": None,
+        "verification_required": True,
+        "spec": spec,
+        "log": log_path,
+        "run_dir": os.path.dirname(os.path.dirname(spec)),
+        "project": proj,
+        "summary": "",
+    }
+    before_porcelain = _git_porcelain(proj)
+    before_hashes = None
+    before_head = None
+    if before_porcelain is not None:
+        before_head = _git_head(proj)
+        try:
+            before_hashes = _hash_status(proj, before_porcelain)
+        except OSError:
+            before_porcelain = None
+            before_head = None
+    tail: collections.deque[str] = collections.deque(maxlen=_SUMMARY_LINES)
+    log_f = None
+    proc = None
+    thread = None
+    try:
+        log_f = _open_log(log_path)
+        agent = _agent_bin()
+        proc = subprocess.Popen(
+            _argv(agent, model, permission, proj, spec),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+        def _pump() -> None:
+            assert proc is not None and proc.stdout is not None
+            try:
+                for line in proc.stdout:
+                    log_f.write(line)
+                    log_f.flush()
+                    tail.append(line)
+            except Exception:
+                return
+
+        thread = threading.Thread(target=_pump, daemon=True)
+        thread.start()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            result["status"] = "timeout"
+            _kill_group(proc)
+        else:
+            result["status"] = "ok" if proc.returncode == 0 else "failed"
+        result["exit_code"] = proc.returncode
+    except Exception as exc:
+        if result["status"] == "error":
+            result["status"] = "launch_error"
+            result["error"] = str(exc)
+        if proc is not None and proc.poll() is None:
+            _kill_group(proc)
+    finally:
+        if thread is not None:
+            thread.join(timeout=30)
+        if proc is not None and proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+        if log_f is not None:
+            try:
+                log_f.close()
+            except Exception:
+                pass
+        result["summary"] = "".join(tail)
+        try:
+            after = hash_control_plane(proj)
+            changed = diff_hashes(before, after)
+            result["changed_paths"] = changed
+            result["control_changed"] = bool(changed)
+        except Exception as exc:
+            result["status"] = "check_error"
+            result["stage"] = "hash_after"
+            result["error"] = str(exc)
+            result["control_changed"] = None
+        try:
+            count, _paths = _files_changed(
+                proj, before_porcelain, before_hashes, before_head,
+            )
+            result["files_changed"] = count
+        except OSError:
+            result["files_changed"] = None
+        # Reported only. A successful run is false; every other status is true.
+        # A spec's verification_required line is ignored.
+        result["verification_required"] = result.get("status") != "ok"
+        if result["status"] == "check_error":
+            code = 4
+        elif result["status"] == "ok" and result["control_changed"] is False:
+            code = 0
+        else:
+            code = 3
+        code = _finish(result, code, result_path)
+    return code
+
+
+def main() -> int:
+    proj = _project()
+    if len(sys.argv) == 3 and sys.argv[1] == "new":
+        return cmd_new(proj, sys.argv[2])
+    if len(sys.argv) != 2:
+        _emit({
+            "status": "bad_input",
+            "error": "usage: cursor-run new <task> | cursor-run <spec>",
+        })
+        return 2
+    return cmd_run(proj, sys.argv[1])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

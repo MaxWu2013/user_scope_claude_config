@@ -1,0 +1,19 @@
+{
+  "conversation_id": "00000000-0000-0000-0000-000000000000",
+  "generation_id": "00000000-0000-0000-0000-000000000000",
+  "model": "grok-4.7",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "/workspace/lib/main.dart",
+    "content": "void main() {}\n"
+  },
+  "tool_use_id": "fixture-tool-use-id",
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "hook_event_name": "preToolUse",
+  "cursor_version": "2026.10.22-27dcf5f",
+  "workspace_roots": [
+    "/workspace"
+  ],
+  "user_email": "user@example.com",
+  "transcript_path": null
+}

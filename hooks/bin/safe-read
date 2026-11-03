@@ -1,0 +1,1889 @@
+#!/usr/bin/env python3
+"""Constrained inspection: validate in parse(), spawn processes only in run()."""
+
+from __future__ import annotations
+
+import codecs
+import errno
+import fcntl
+import os
+import re
+import selectors
+import shutil
+import subprocess
+import sys
+import time
+
+FIXED_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+VAULT_ROOT = "~/workplace/project/Obsidian_doc"
+ROOTS_FILE = "~/.claude/hooks/data/safe-read-roots"
+
+TIMEOUT = 30
+MAX_STDOUT_BYTES = 200 * 1024
+MAX_STDERR_BYTES = 20 * 1024
+MAX_LINES = 2000
+MAX_LINE_CHARS = 2000
+# Internal machine-readable git output (NUL-delimited paths). Separate from the
+# user-visible line cap: `git ls-files -z` is one record with no newline, and a
+# 2000-character line cut would refuse every git command once LFS paths exceed
+# that. Exceeding this cap refuses the list; it is never parsed as complete.
+MAX_MACHINE_BYTES = 1024 * 1024
+
+LIMIT_LINES = "2000 lines"
+LIMIT_STDOUT = "200 KB"
+LIMIT_STDERR = "20 KB"
+LINE_MARK = " \u2026[line truncated]"
+
+_REV_RE = re.compile(r"^[A-Za-z0-9._/~^@{}-]+$")
+_BLAME_RE = re.compile(r"-?\d{1,9},-?\d{1,9}\Z")
+_FILTER_RE = r"^filter\..*\.(clean|smudge|process)$"
+# Exact (key, value) pairs. Anything else, in any scope, is refused.
+_ALLOWED_FILTERS = {
+    ("filter.lfs.clean", "git-lfs clean -- %f"),
+    ("filter.lfs.smudge", "git-lfs smudge -- %f"),
+    ("filter.lfs.process", "git-lfs filter-process"),
+}
+
+_DIFF_FLAGS = {"--stat", "--name-only", "--name-status", "--cached"}
+_SHOW_FLAGS = {"--stat", "--name-only"}
+_LOG_FLAGS = {"--oneline", "-p"}
+_RG_FLAGS = {"-n", "-i", "-l", "-w", "-F"}
+_RG_MAX_PATTERNS = 10
+
+HELP = """\
+| sub | runs | allowed options |
+| git-status | git status --short | --repo <path> |
+| git-diff [REV[..REV]] [-- PATH\u2026] | git diff | --repo <path> --stat --name-only --name-status --cached -U<n>(0-20) |
+| git-show REV [-- PATH\u2026] | git show | --repo <path> --stat --name-only |
+| git-log [-- PATH\u2026] | git log | --repo <path> -n <N>(1-200) --oneline -p |
+| git-blame PATH | git blame | --repo <path> -L a,b (ints) |
+| rg [-e PATTERN]\u2026 | PATTERN [PATH\u2026] | rg --no-config | -n -i -l -w -F -C <n>(0-10) -g <glob> |
+| ls PATH | ls -la | \u2014 |
+| wc PATH | wc -l | \u2014 |
+--repo <path> names a git work tree inside an allowed root. Git subcommands run there, and path arguments resolve relative to it.
+"""
+
+
+class Reject(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class Plan:
+    def __init__(self, sub: str, cwd: str, user_args: tuple[str, ...] = ()) -> None:
+        self.sub = sub
+        self.cwd = cwd
+        self.user_args = user_args
+
+
+class Result:
+    def __init__(self, code: int, stdout: str, stderr: str, notice: str = "") -> None:
+        self.code = code
+        self.stdout = stdout
+        self.stderr = stderr
+        # Truncation banner already included at the end of stdout, if any.
+        self.notice = notice
+
+
+class _Args:
+    def __init__(self, items: list[str]) -> None:
+        self._items = items
+        self._i = 0
+
+    def __bool__(self) -> bool:
+        return self._i < len(self._items)
+
+    def next(self) -> str:
+        if self._i >= len(self._items):
+            raise Reject("missing argument")
+        item = self._items[self._i]
+        self._i += 1
+        return item
+
+    def __contains__(self, item: object) -> bool:
+        return item in self._items[self._i:]
+
+
+def _inside(root: str, path: str) -> bool:
+    if path == root:
+        return True
+    return path.startswith(root + os.sep)
+
+
+def _extra_roots() -> list[str]:
+    """Paths from ~/.claude/hooks/data/safe-read-roots. Missing or unreadable means none."""
+    path = os.path.expanduser(ROOTS_FILE)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except (OSError, UnicodeError):
+        return []
+    found: list[str] = []
+    for line in text.splitlines():
+        entry = line.strip()
+        if entry == "" or entry.startswith("#"):
+            continue
+        try:
+            resolved = os.path.realpath(os.path.expanduser(entry))
+            if os.path.isdir(resolved) and resolved not in found:
+                found.append(resolved)
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def _allowed_roots() -> list[str]:
+    raw = os.environ.get("CLAUDE_PROJECT_DIR")
+    if raw:
+        if "\0" in raw:
+            raise Reject("NUL byte in argument")
+        try:
+            primary = os.path.realpath(raw)
+        except (OSError, ValueError):
+            raise Reject("working directory is outside allowed roots")
+    else:
+        try:
+            primary = os.path.realpath(os.getcwd())
+        except (OSError, ValueError):
+            raise Reject("working directory is outside allowed roots")
+    try:
+        vault = os.path.realpath(os.path.expanduser(VAULT_ROOT))
+    except (OSError, ValueError):
+        vault = ""
+    roots = [primary]
+    if vault and vault not in roots:
+        roots.append(vault)
+    for extra in _extra_roots():
+        if extra not in roots:
+            roots.append(extra)
+    return roots
+
+
+def _require_cwd(roots: list[str]) -> str:
+    try:
+        cwd = os.path.realpath(os.getcwd())
+    except (OSError, ValueError):
+        raise Reject("working directory is outside allowed roots")
+    if not any(_inside(root, cwd) for root in roots):
+        raise Reject("working directory is outside allowed roots")
+    return cwd
+
+
+def _is_git_work_tree(path: str) -> bool:
+    current = path
+    while True:
+        marker = os.path.join(current, ".git")
+        try:
+            if os.path.isdir(marker) or os.path.isfile(marker):
+                return True
+        except (OSError, ValueError):
+            return False
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
+
+
+def _resolve_repo(path: str, cwd: str, roots: list[str]) -> str:
+    resolved = _resolve_path(path, cwd, roots)
+    try:
+        is_dir = os.path.isdir(resolved)
+    except (OSError, ValueError):
+        raise Reject(f"invalid --repo: {path}")
+    if not is_dir or not _is_git_work_tree(resolved):
+        raise Reject(f"invalid --repo: {path}")
+    return resolved
+
+
+def _extract_repo(args: list[str], cwd: str, roots: list[str]) -> tuple[str, list[str]]:
+    """Pull --repo <path> out of a git subcommand. Paths then resolve against it."""
+    out: list[str] = []
+    repo: str | None = None
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == "--":
+            out.extend(args[i:])
+            break
+        if tok == "--repo" or tok.startswith("--repo="):
+            if repo is not None:
+                raise Reject("duplicate --repo")
+            if tok == "--repo":
+                if i + 1 >= len(args):
+                    raise Reject("missing value for --repo")
+                raw = args[i + 1]
+                i += 2
+            else:
+                raw = tok[len("--repo="):]
+                if raw == "":
+                    raise Reject("missing value for --repo")
+                i += 1
+            repo = _resolve_repo(raw, cwd, roots)
+            continue
+        out.append(tok)
+        i += 1
+    return (cwd if repo is None else repo), out
+
+
+def _resolve_path(path: str, cwd: str, roots: list[str]) -> str:
+    if path == "":
+        raise Reject("empty path")
+    expanded = os.path.expanduser(path) if path.startswith("~") else path
+    candidate = expanded if os.path.isabs(expanded) else os.path.join(cwd, expanded)
+    try:
+        resolved = os.path.realpath(candidate)
+    except (OSError, ValueError):
+        raise Reject(f"path outside allowed roots: {path}")
+    if not any(_inside(root, resolved) for root in roots):
+        raise Reject(f"path outside allowed roots: {path}")
+    return resolved
+
+
+def _check_rev(rev: str) -> None:
+    if rev.startswith("-"):
+        raise Reject(f"invalid REV: {rev}")
+    if len(rev) > 200:
+        raise Reject("REV exceeds 200 characters")
+    if _REV_RE.fullmatch(rev) is None:
+        raise Reject(f"invalid REV: {rev}")
+
+
+def _rev_ok(rev: str, cwd: str, roots: list[str]) -> None:
+    """REVs are not paths, but reject tokens that escape when read as paths."""
+    _check_rev(rev)
+    expanded = os.path.expanduser(rev) if rev.startswith("~") else rev
+    absolute = os.path.isabs(expanded)
+    candidate = expanded if absolute else os.path.join(cwd, expanded)
+    suspicious = (
+        absolute
+        or rev.startswith("~")
+        or "/" in rev
+        or rev in {".", ".."}
+        or os.path.lexists(candidate)
+    )
+    if not suspicious:
+        return
+    try:
+        resolved = os.path.realpath(candidate)
+    except (OSError, ValueError):
+        raise Reject(f"path outside allowed roots: {rev}")
+    if not any(_inside(root, resolved) for root in roots):
+        raise Reject(f"path outside allowed roots: {rev}")
+
+
+def _check_literal(text: str, what: str, limit: int) -> None:
+    if text.startswith("-"):
+        raise Reject(f"{what} must not start with '-'")
+    if len(text) > limit:
+        raise Reject(f"{what} exceeds {limit} characters")
+
+
+def _check_pattern(text: str, *, allow_dash: bool) -> None:
+    """Pattern-string checks. A leading '-' is rejected except for an `-e` value."""
+    if text == "":
+        raise Reject("empty pattern")
+    if allow_dash:
+        if len(text) > 500:
+            raise Reject("pattern exceeds 500 characters")
+        return
+    _check_literal(text, "pattern", 500)
+
+
+def _bounded_int(opt: str, token: str, rest: _Args, lo: int, hi: int) -> tuple[str, ...]:
+    if token == opt:
+        if not rest:
+            raise Reject(f"missing value for {opt}")
+        raw = rest.next()
+    elif token.startswith(opt) and token[len(opt):].isdigit():
+        raw = token[len(opt):]
+    else:
+        raise Reject(f"unknown option: {token}")
+    if len(raw) > 6 or not raw.isdigit():
+        raise Reject(f"invalid {opt}: {raw}")
+    value = int(raw)
+    if value < lo or value > hi:
+        raise Reject(f"{opt} out of range ({lo}-{hi}): {value}")
+    if opt == "-U":
+        return (f"-U{value}",)
+    return (opt, str(value))
+
+
+def _parse_L(token: str, rest: _Args) -> tuple[str, str]:
+    if token == "-L":
+        if not rest:
+            raise Reject("missing value for -L")
+        raw = rest.next()
+    elif token.startswith("-L") and len(token) > 2:
+        raw = token[2:]
+    else:
+        raise Reject(f"unknown option: {token}")
+    if _BLAME_RE.fullmatch(raw) is None:
+        raise Reject(f"invalid -L: {raw}")
+    return ("-L", raw)
+
+
+def _is_pattern_pathspec(token: str) -> bool:
+    """True for git magic or wildcard pathspecs. Literal paths still go through realpath."""
+    if token.startswith(":(") or token.startswith((":/", ":!", ":^")):
+        return True
+    return any(ch in token for ch in "*?[")
+
+
+def _pattern_body(token: str) -> str:
+    if token.startswith(":("):
+        end = token.find(")")
+        if end == -1:
+            raise Reject(f"invalid pathspec: {token}")
+        return token[end + 1 :]
+    if token.startswith((":/", ":!", ":^")):
+        i = 1
+        while i < len(token) and token[i] in "/!^":
+            i += 1
+        return token[i:]
+    return token
+
+
+def _pattern_pathspec(token: str, cwd: str, roots: list[str]) -> str:
+    """Pass a wildcard or magic pathspec through unchanged so git evaluates it.
+
+    realpath() would turn `:(glob)**/*.bin` into `<cwd>/:(glob)**/*.bin`, which
+    is no longer magic and matches nothing. Literal paths stay on `_resolve_path`.
+    `..` and absolute patterns outside the allowed roots are rejected here; git
+    also refuses pathspecs outside the worktree, but that would be exit 128
+    rather than a parse rejection.
+    """
+    del cwd
+    body = _pattern_body(token)
+    if body == "":
+        raise Reject("empty path")
+    parts = body.split("/")
+    if any(part == ".." for part in parts) or body.startswith("~"):
+        raise Reject(f"path outside allowed roots: {token}")
+    if body.startswith("/"):
+        prefix = body
+        for i, ch in enumerate(body):
+            if ch in "*?[":
+                prefix = body[:i]
+                break
+        directory = prefix if prefix.endswith("/") else os.path.dirname(prefix)
+        if directory == "":
+            directory = "/"
+        try:
+            resolved = os.path.realpath(directory)
+        except (OSError, ValueError):
+            raise Reject(f"path outside allowed roots: {token}")
+        if not any(_inside(root, resolved) for root in roots):
+            raise Reject(f"path outside allowed roots: {token}")
+    return token
+
+
+def _pathspec(token: str, cwd: str, roots: list[str]) -> str:
+    if _is_pattern_pathspec(token):
+        return _pattern_pathspec(token, cwd, roots)
+    return _resolve_path(token, cwd, roots)
+
+
+def _take_paths(rest: _Args, cwd: str, roots: list[str]) -> list[str]:
+    paths: list[str] = []
+    while rest:
+        paths.append(_pathspec(rest.next(), cwd, roots))
+    return paths
+
+
+def _parse_git_status(rest: _Args, cwd: str, roots: list[str]) -> tuple[str, ...]:
+    del cwd, roots
+    if rest:
+        tok = rest.next()
+        if tok.startswith("-"):
+            raise Reject(f"unknown option: {tok}")
+        raise Reject(f"unexpected argument: {tok}")
+    return ()
+
+
+def _parse_with_rev(
+    rest: _Args,
+    cwd: str,
+    roots: list[str],
+    *,
+    flags: set[str],
+    allow_u: bool,
+    allow_rev: bool,
+    require_rev: bool,
+) -> tuple[str, ...]:
+    out: list[str] = []
+    rev: str | None = None
+    while rest:
+        tok = rest.next()
+        if tok == "--":
+            paths = _take_paths(rest, cwd, roots)
+            if paths:
+                out.append("--")
+                out.extend(paths)
+            break
+        if tok.startswith("-"):
+            if tok in flags:
+                out.append(tok)
+            elif allow_u and (tok == "-U" or (tok.startswith("-U") and tok[2:].isdigit())):
+                out.extend(_bounded_int("-U", tok, rest, 0, 20))
+            else:
+                raise Reject(f"unknown option: {tok}")
+            continue
+        if not allow_rev:
+            raise Reject(f"unexpected argument: {tok}")
+        if rev is not None:
+            raise Reject(f"unexpected argument: {tok}")
+        _rev_ok(tok, cwd, roots)
+        rev = tok
+        out.append(tok)
+    if require_rev and rev is None:
+        raise Reject("missing REV")
+    return tuple(out)
+
+
+def _parse_git_log(rest: _Args, cwd: str, roots: list[str]) -> tuple[str, ...]:
+    out: list[str] = []
+    while rest:
+        tok = rest.next()
+        if tok == "--":
+            paths = _take_paths(rest, cwd, roots)
+            if paths:
+                out.append("--")
+                out.extend(paths)
+            break
+        if tok in _LOG_FLAGS:
+            out.append(tok)
+            continue
+        if tok == "-n" or (tok.startswith("-n") and tok[2:].isdigit()):
+            out.extend(_bounded_int("-n", tok, rest, 1, 200))
+            continue
+        if tok.startswith("-"):
+            raise Reject(f"unknown option: {tok}")
+        raise Reject(f"unexpected argument: {tok}")
+    return tuple(out)
+
+
+def _parse_git_blame(rest: _Args, cwd: str, roots: list[str]) -> tuple[str, ...]:
+    opts: list[str] = []
+    paths: list[str] = []
+    while rest:
+        tok = rest.next()
+        if tok == "--":
+            while rest:
+                paths.append(rest.next())
+            break
+        if tok.startswith("-"):
+            opts.extend(_parse_L(tok, rest))
+            continue
+        paths.append(tok)
+    if not paths:
+        raise Reject("missing PATH")
+    if len(paths) != 1:
+        raise Reject(f"unexpected argument: {paths[1]}")
+    resolved = _resolve_path(paths[0], cwd, roots)
+    return (*opts, "--", resolved)
+
+
+def _parse_rg(rest: _Args, cwd: str, roots: list[str]) -> tuple[str, ...]:
+    # Repeated `-e` expresses alternation without `|`, `(`, or `)` in one
+    # pattern. With any `-e`, there is no positional pattern: every positional
+    # argument is a path. Patterns are separate argv elements, never a shell.
+    use_e = "-e" in rest
+    out: list[str] = []
+    pattern: str | None = None
+    patterns = 0
+    while rest:
+        tok = rest.next()
+        if tok == "--":
+            raise Reject("unknown option: --")
+        if tok == "-e":
+            if not rest:
+                raise Reject("missing value for -e")
+            pat = rest.next()
+            _check_pattern(pat, allow_dash=True)
+            patterns += 1
+            if patterns > _RG_MAX_PATTERNS:
+                raise Reject(f"too many patterns (max {_RG_MAX_PATTERNS})")
+            out.append("-e")
+            out.append(pat)
+            continue
+        if tok.startswith("-"):
+            if tok in _RG_FLAGS:
+                out.append(tok)
+                continue
+            if tok == "-C" or (tok.startswith("-C") and tok[2:].isdigit()):
+                out.extend(_bounded_int("-C", tok, rest, 0, 10))
+                continue
+            if tok == "-g":
+                if not rest:
+                    raise Reject("missing value for -g")
+                glob = rest.next()
+                _check_literal(glob, "glob", 500)
+                out.append("-g")
+                out.append(glob)
+                continue
+            raise Reject(f"unknown option: {tok}")
+        if use_e or pattern is not None:
+            out.append(_resolve_path(tok, cwd, roots))
+            continue
+        _check_pattern(tok, allow_dash=False)
+        pattern = tok
+        out.append(tok)
+    if use_e:
+        if patterns == 0:
+            raise Reject("missing PATTERN")
+    elif pattern is None:
+        raise Reject("missing PATTERN")
+    return tuple(out)
+
+
+def _parse_one_path(rest: _Args, cwd: str, roots: list[str]) -> tuple[str, ...]:
+    paths: list[str] = []
+    while rest:
+        tok = rest.next()
+        if tok == "--":
+            while rest:
+                paths.append(rest.next())
+            break
+        if tok.startswith("-"):
+            raise Reject(f"unknown option: {tok}")
+        paths.append(tok)
+    if not paths:
+        raise Reject("missing PATH")
+    if len(paths) != 1:
+        raise Reject(f"unexpected argument: {paths[1]}")
+    return (_resolve_path(paths[0], cwd, roots),)
+
+
+def parse(argv: list[str]) -> Plan:
+    if argv is None:
+        raise Reject("missing subcommand")
+    args = list(argv)
+    for arg in args:
+        if not isinstance(arg, str):
+            raise Reject("invalid argument")
+        if "\0" in arg:
+            raise Reject("NUL byte in argument")
+    roots = _allowed_roots()
+    cwd = _require_cwd(roots)
+    if not args:
+        raise Reject("missing subcommand")
+    sub = args[0]
+    rest = _Args(args[1:])
+    if sub == "help":
+        if rest:
+            raise Reject(f"unexpected argument: {rest.next()}")
+        return Plan("help", cwd, ())
+    parsers = {
+        "git-status": _parse_git_status,
+        "git-diff": lambda r, c, o: _parse_with_rev(
+            r, c, o, flags=_DIFF_FLAGS, allow_u=True, allow_rev=True, require_rev=False
+        ),
+        "git-show": lambda r, c, o: _parse_with_rev(
+            r, c, o, flags=_SHOW_FLAGS, allow_u=False, allow_rev=True, require_rev=True
+        ),
+        "git-log": _parse_git_log,
+        "git-blame": _parse_git_blame,
+        "rg": _parse_rg,
+        "ls": _parse_one_path,
+        "wc": _parse_one_path,
+    }
+    parser = parsers.get(sub)
+    if parser is None:
+        raise Reject(f"unknown subcommand: {sub}")
+    items = args[1:]
+    base = cwd
+    if sub.startswith("git-"):
+        base, items = _extract_repo(items, cwd, roots)
+    user_args = parser(_Args(items), base, roots)
+    return Plan(sub, base, user_args)
+
+
+def _git_prefix(exe: str, overrides: tuple[str, ...] = ()) -> list[str]:
+    argv = [
+        exe,
+        "--no-pager",
+        "-c", "core.fsmonitor=false",
+        "-c", "core.hooksPath=/dev/null",
+        "-c", "diff.external=",
+        "-c", "core.untrackedCache=false",
+        "-c", "core.preloadIndex=false",
+    ]
+    for item in overrides:
+        argv.extend(["-c", item])
+    return argv
+
+
+_DIFF_SAFETY = ("--no-ext-diff", "--no-textconv", "--no-color")
+
+
+def _command(exe: str, plan: Plan, overrides: tuple[str, ...] = ()) -> list[str]:
+    sub = plan.sub
+    prefix = _git_prefix(exe, overrides)
+    if sub == "git-status":
+        return prefix + ["status", "--short"]
+    if sub == "git-diff":
+        return prefix + ["diff", *_DIFF_SAFETY, *plan.user_args]
+    if sub == "git-show":
+        return prefix + ["show", *_DIFF_SAFETY, *plan.user_args]
+    if sub == "git-log":
+        return prefix + ["log", *_DIFF_SAFETY, *plan.user_args]
+    if sub == "git-blame":
+        # Blame runs textconv drivers unless this is set. diff/show/log already pass it.
+        return prefix + ["blame", "--no-textconv", *plan.user_args]
+    if sub == "rg":
+        return [exe, "--no-config", *plan.user_args]
+    if sub == "ls":
+        return [exe, "-la", "--", *plan.user_args]
+    if sub == "wc":
+        return [exe, "-l", "--", *plan.user_args]
+    raise RuntimeError(f"unsupported plan: {sub}")
+
+
+def _env() -> dict[str, str]:
+    home = os.environ.get("HOME") or os.path.expanduser("~")
+    return {
+        "PATH": FIXED_PATH,
+        "HOME": home,
+        "LANG": "C.UTF-8",
+        "GIT_PAGER": "cat",
+        "PAGER": "cat",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+    }
+
+
+class _Stream:
+    """Bounded stdout/stderr accumulator. Never stores more than the caps."""
+
+    def __init__(self, max_bytes: int, byte_label: str) -> None:
+        self.max_bytes = max_bytes
+        self.byte_label = byte_label
+        self.max_lines = MAX_LINES
+        self.max_chars = MAX_LINE_CHARS
+        self.read_bytes = 0
+        self.lines = 0
+        self.reason: str | None = None
+        self._dec = codecs.getincrementaldecoder("utf-8")("replace")
+        self._parts: list[str] = []
+        self._buf: list[str] = []
+        self._chars = 0
+        self._cut = False
+        self._past_lines = False
+        self._done = False
+        self._cached = ""
+        self.notice = ""
+
+    def feed(self, data: bytes) -> bool:
+        if self.reason is not None:
+            return False
+        self.read_bytes += len(data)
+        return self._consume(self._dec.decode(data, False))
+
+    def _consume(self, text: str) -> bool:
+        for ch in text:
+            if self._past_lines:
+                self.reason = LIMIT_LINES
+                return False
+            if ch == "\n":
+                self._emit(newline=True)
+                if self.lines >= self.max_lines:
+                    self._past_lines = True
+                continue
+            if self._cut:
+                continue
+            if self._chars >= self.max_chars:
+                self._cut = True
+                self._buf.append(LINE_MARK)
+                continue
+            self._buf.append(ch)
+            self._chars += 1
+        return True
+
+    def _emit(self, newline: bool) -> None:
+        self._parts.append("".join(self._buf))
+        self._buf.clear()
+        self._chars = 0
+        self._cut = False
+        if newline:
+            self._parts.append("\n")
+        self.lines += 1
+
+    def finish(self) -> str:
+        if self._done:
+            return self._cached
+        if self.reason is None:
+            tail = self._dec.decode(b"", True)
+            if tail:
+                self._consume(tail)
+        else:
+            self._dec.decode(b"", True)
+        if self._buf:
+            self._emit(newline=self.reason is not None)
+        notice = ""
+        if self.reason:
+            notice = f"[safe-read: output truncated at {self.reason}]\n"
+        body = "".join(self._parts)
+        fitted = _fit(body, notice, self.max_bytes, self.byte_label)
+        if not notice and fitted != body:
+            notice = f"[safe-read: output truncated at {self.byte_label}]\n"
+        self.notice = notice
+        self._cached = fitted
+        self._done = True
+        self._parts.clear()
+        self._buf.clear()
+        return self._cached
+
+
+def _fit(body: str, notice: str, max_bytes: int, byte_label: str) -> str:
+    raw = body.encode("utf-8", "replace")
+    if not notice and len(raw) > max_bytes:
+        notice = f"[safe-read: output truncated at {byte_label}]\n"
+    notice_b = notice.encode("utf-8")
+    budget = max_bytes - len(notice_b)
+    if budget < 0:
+        return notice_b[:max_bytes].decode("utf-8", "ignore")
+    if len(raw) > budget:
+        raw = raw[:budget]
+        body = raw.decode("utf-8", "ignore")
+    return body + notice
+
+
+def _nonblock(fd: int) -> None:
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+
+def _read_fd(fd: int, size: int) -> bytes | None:
+    while True:
+        try:
+            return os.read(fd, size)
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                if exc.errno == errno.EINTR:
+                    continue
+                return None
+            raise
+
+
+def _kill(proc: subprocess.Popen[bytes]) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _close_pipes(proc: subprocess.Popen[bytes]) -> None:
+    for stream in (proc.stdout, proc.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _pump(
+    proc: subprocess.Popen[bytes],
+    out: _Stream,
+    err: _Stream,
+    deadline: float,
+) -> tuple[bool, bool]:
+    assert proc.stdout is not None and proc.stderr is not None
+    out_fd = proc.stdout.fileno()
+    err_fd = proc.stderr.fileno()
+    _nonblock(out_fd)
+    _nonblock(err_fd)
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ, (out, out_fd))
+    sel.register(proc.stderr, selectors.EVENT_READ, (err, err_fd))
+    timed_out = False
+    limited = False
+    try:
+        while sel.get_map():
+            now = time.monotonic()
+            if now >= deadline:
+                timed_out = True
+                break
+            events = sel.select(timeout=deadline - now)
+            if not events:
+                timed_out = True
+                break
+            stop = False
+            for key, _mask in events:
+                acc, fd = key.data
+                if acc.reason is not None:
+                    stop = True
+                    break
+                if acc.read_bytes >= acc.max_bytes:
+                    extra = _read_fd(fd, 1)
+                    if extra is None:
+                        continue
+                    if extra == b"":
+                        sel.unregister(key.fileobj)
+                        continue
+                    acc.reason = acc.byte_label
+                    stop = True
+                    break
+                room = acc.max_bytes - acc.read_bytes
+                chunk = _read_fd(fd, min(8192, room))
+                if chunk is None:
+                    continue
+                if chunk == b"":
+                    sel.unregister(key.fileobj)
+                    continue
+                if not acc.feed(chunk):
+                    stop = True
+                    break
+            if stop:
+                limited = True
+                break
+    finally:
+        sel.close()
+    return timed_out, limited
+
+
+def _bounded_run(argv: list[str], cwd: str, env: dict[str, str]) -> Result:
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            shell=False,
+            cwd=cwd,
+            env=env,
+            bufsize=0,
+        )
+    except OSError as exc:
+        return Result(1, "", f"safe-read: {exc}\n")
+    out = _Stream(MAX_STDOUT_BYTES, LIMIT_STDOUT)
+    err = _Stream(MAX_STDERR_BYTES, LIMIT_STDERR)
+    deadline = time.monotonic() + TIMEOUT
+    try:
+        timed_out, limited = _pump(proc, out, err, deadline)
+        if timed_out or limited:
+            _kill(proc)
+        elif proc.poll() is None:
+            remaining = deadline - time.monotonic()
+            try:
+                proc.wait(timeout=max(0.0, remaining))
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill(proc)
+        out_text = out.finish()
+        err_text = err.finish()
+    finally:
+        if proc.poll() is None:
+            _kill(proc)
+        _close_pipes(proc)
+    if timed_out:
+        if err_text and not err_text.endswith("\n"):
+            err_text += "\n"
+        err_text += "safe-read: timeout\n"
+        return Result(4, out_text, err_text, out.notice)
+    if limited:
+        return Result(0, out_text, err_text, out.notice)
+    code = proc.returncode
+    if code is None or code < 0:
+        code = 1
+    return Result(code, out_text, err_text, out.notice)
+
+
+def _refused(reason: str) -> Result:
+    return Result(3, "", f"safe-read: refused: {reason}\n")
+
+
+def _parse_filter_entries(stdout: str) -> list[tuple[str, str]] | None:
+    """Parse `git config --get-regexp` stdout into (key, value) lines.
+
+    Returns None when the text is not a complete series of "key value" lines.
+    """
+    if "[safe-read:" in stdout:
+        return None
+    if stdout == "":
+        return []
+    if not stdout.endswith("\n"):
+        return None
+    entries: list[tuple[str, str]] = []
+    for line in stdout.splitlines():
+        if line == "":
+            return None
+        key, sep, value = line.partition(" ")
+        if sep == "" or key == "" or any(ch.isspace() for ch in key):
+            return None
+        entries.append((key, value))
+    return entries
+
+
+def _driver_name(key: str) -> str | None:
+    if not key.startswith("filter."):
+        return None
+    name, dot, kind = key[len("filter."):].rpartition(".")
+    if dot != "." or kind not in ("clean", "smudge", "process") or name == "":
+        return None
+    return name
+
+
+def _filter_overrides(names: list[str]) -> tuple[str, ...]:
+    # Git 2.52.0 + git-lfs 3.7.1, on a file attributed
+    # `*.bin filter=lfs diff=lfs merge=lfs -text`, with the standard global
+    # filter.lfs clean/smudge/process/required settings:
+    # plain `git status` runs `git-lfs filter-process` and creates .git/lfs.
+    # diff and blame launch it too. show and `log -p` do not, for a blob that
+    # is not an LFS pointer. GIT_TRACE and a PATH wrapper in front of git-lfs
+    # agreed on the following, and diff still showed the real bytes (v1/v2):
+    #   -c filter.<name>.clean=
+    #   -c filter.<name>.smudge=
+    #   -c filter.<name>.process=
+    #   -c filter.<name>.required=false
+    # makes git treat the driver as absent (no git-lfs process, no .git/lfs,
+    # commands exit 0).
+    # Empty clean/smudge/process while required stays true exits 128
+    # ("fatal: a.bin: clean filter 'lfs' failed").
+    # Empty clean/smudge while process is still `git-lfs filter-process`
+    # still launches git-lfs and creates .git/lfs.
+    # `required=false` plus an empty process is enough to skip the launch on
+    # this git, because the process driver replaces clean/smudge. clean and
+    # smudge are cleared as well so a fallback cannot start git-lfs.
+    # /usr/bin/true is not used for clean: it writes no stdout and would
+    # replace file content.
+    overrides: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        overrides.extend([
+            f"filter.{name}.clean=",
+            f"filter.{name}.smudge=",
+            f"filter.{name}.process=",
+            f"filter.{name}.required=false",
+        ])
+    return tuple(overrides)
+
+
+def _filters_refuse(exe: str, cwd: str, env: dict[str, str]) -> tuple[Result | None, tuple[str, ...]]:
+    # Effective config: local, global, XDG, include.path, and includeIf.
+    # --local would miss the Git LFS filters defined in ~/.gitconfig, and a
+    # blanket refusal of those would refuse every repository.
+    argv = _git_prefix(exe) + ["config", "--includes", "--get-regexp", _FILTER_RE]
+    result = _bounded_run(argv, cwd, env)
+    # Exit 0: entries. Exit 1: none. Any other code, including timeout (4),
+    # is a failed read — do not treat that as "no filters".
+    if result.code not in (0, 1):
+        return _refused("could not read git filter config"), ()
+    if result.code == 1:
+        # A non-empty body is not the "no entries" result git prints on exit 1.
+        if result.stdout != "":
+            return _refused("could not read git filter config"), ()
+        return None, ()
+    entries = _parse_filter_entries(result.stdout)
+    if not entries:
+        return _refused("could not read git filter config"), ()
+    names: list[str] = []
+    for key, value in entries:
+        if (key, value) not in _ALLOWED_FILTERS:
+            return _refused("repo defines filters"), ()
+        name = _driver_name(key)
+        if name is None:
+            return _refused("repo defines filters"), ()
+        names.append(name)
+    return None, _filter_overrides(names)
+
+
+# Git 2.52.0, from the worktree root and from a subdirectory. Neither form
+# starts git-lfs. Without `top`, both pathspecs are limited to the current
+# prefix: ls-files omits LFS paths outside that directory, and
+# `:(exclude,attr:filter=lfs)` still reports them (`../top.bin` in status,
+# `diff --git a/top.bin` in diff). `top` matches from the worktree root.
+# `--full-name` prints those paths root-relative (`sub/in.bin`, `top.bin`),
+# not prefix-relative (`in.bin`, `../top.bin`).
+# From a subdirectory, `:(top,exclude,attr:filter=lfs)` drops every LFS path
+# and leaves the same non-LFS paths as the command with no pathspec (status
+# stays cwd-relative; diff stays root-relative). The same exclude from the
+# worktree root matches `:(exclude,attr:filter=lfs)`.
+# With the allowlisted driver neutralized, git compares worktree bytes to the
+# pointer blob, so status/diff/blame cannot be trusted for those paths.
+# Git 2.52.0 ORs pathspecs. `ls-files -- ':(top,attr:filter=lfs)' src.txt`
+# returns every LFS path plus src.txt, not the intersection. `:(exclude,attr:!filter=lfs)`
+# is rejected ("invalid attribute name"). Scope is therefore two git results:
+# paths matching the user's pathspecs, intersected with the filter=lfs list.
+# `:(top,exclude,attr:!filter)` does drop paths whose filter attribute is unset
+# (so `sub` keeps sub/in.bin and drops sub/src.txt) but it also keeps any other
+# filter value. The intersection uses the filter=lfs list, not that broader form.
+# Do not reimplement globs in Python.
+#
+# Untracked `new.bin` (attribute *.bin filter=lfs): `git status` with the exclude
+# drops `?? new.bin`; `git diff` never lists untracked paths, with or without the
+# exclude. `git ls-files --deleted` names a worktree deletion that is still in
+# the index (already in the tracked attr list) and does not name `git rm`, which
+# has left the index. `git status` with the exclude also drops that staged
+# `D  a.bin`. `git ls-files --deleted --with-tree=HEAD` names both; an unborn
+# repository has no HEAD and therefore no staged deletion. `git diff` (index vs
+# worktree) does not show the staged deletion either way. Status hides it, so
+# the worktree footer names it. A pathspec that does not match the path does not.
+_LFS_LIST_SPEC = ":(top,attr:filter=lfs)"
+_LFS_EXCLUDE_SPEC = ":(top,exclude,attr:filter=lfs)"
+_UNRESOLVED_PREFIX = (
+    "[safe-read: unresolved: LFS-tracked paths are excluded; "
+    "with LFS filters disabled their worktree state cannot be compared reliably: "
+)
+_POINTER_PREFIX = (
+    "[safe-read: note: LFS-tracked paths are shown as LFS pointer text, not file content: "
+)
+_NS_RE = re.compile(r"^(?:[ACDMTUXB]\d*|R\d+|C\d+)\t(.+)$")
+
+
+def _parse_z_paths(stdout: str) -> list[str] | None:
+    """Parse a complete NUL-delimited path list.
+
+    A path may contain newlines or the text "[safe-read:". Those are data.
+    Truncation is reported by the machine reader, not by scanning the payload:
+    a cut that happens to end on NUL must not look like a finished list, and a
+    crafted path must not refuse the command.
+    """
+    if stdout == "":
+        return []
+    # git ls-files -z ends with NUL. A missing terminator means the list was cut.
+    if not stdout.endswith("\0"):
+        return None
+    parts = stdout.split("\0")[:-1]
+    if any(part == "" for part in parts):
+        return None
+    return parts
+
+
+def _parse_z_names(stdout: str) -> list[str] | None:
+    """Like `_parse_z_paths`, but empty fields are commit separators, not corruption.
+
+    `git log --name-only -z --pretty=format:` writes `path\\0\\0path\\0` between commits.
+    """
+    if stdout == "":
+        return []
+    if not stdout.endswith("\0"):
+        return None
+    return [part for part in stdout.split("\0")[:-1] if part != ""]
+
+
+def _capture_machine(argv: list[str], cwd: str, env: dict[str, str]) -> tuple[str, int, bytes]:
+    """Read one git command's stdout as raw bytes, with a hard cap and the shared timeout.
+
+    Status is "ok", "overflow", "timeout", or "error". Anything but "ok" returns
+    empty stdout so a partial NUL record cannot be parsed as a complete list.
+    No per-line character cap: NUL-delimited output has no newlines.
+    """
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            shell=False,
+            cwd=cwd,
+            env=env,
+            bufsize=0,
+        )
+    except OSError:
+        return "error", 1, b""
+    assert proc.stdout is not None and proc.stderr is not None
+    out = bytearray()
+    err_read = 0
+    out_fd = proc.stdout.fileno()
+    err_fd = proc.stderr.fileno()
+    _nonblock(out_fd)
+    _nonblock(err_fd)
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ, "out")
+    sel.register(proc.stderr, selectors.EVENT_READ, "err")
+    deadline = time.monotonic() + TIMEOUT
+    status = "ok"
+    try:
+        while sel.get_map():
+            now = time.monotonic()
+            if now >= deadline:
+                status = "timeout"
+                break
+            events = sel.select(timeout=deadline - now)
+            if not events:
+                status = "timeout"
+                break
+            for key, _mask in events:
+                chunk = _read_fd(key.fileobj.fileno(), 8192)
+                if chunk is None:
+                    continue
+                if chunk == b"":
+                    sel.unregister(key.fileobj)
+                    continue
+                if key.data == "err":
+                    err_read += len(chunk)
+                    if err_read > MAX_MACHINE_BYTES:
+                        status = "overflow"
+                        break
+                    continue
+                out.extend(chunk)
+                if len(out) > MAX_MACHINE_BYTES:
+                    status = "overflow"
+                    break
+            if status != "ok":
+                break
+        if status == "ok" and proc.poll() is None:
+            remaining = deadline - time.monotonic()
+            try:
+                proc.wait(timeout=max(0.0, remaining))
+            except subprocess.TimeoutExpired:
+                status = "timeout"
+    finally:
+        sel.close()
+        if proc.poll() is None:
+            _kill(proc)
+        _close_pipes(proc)
+    if status != "ok":
+        return status, 1, b""
+    code = proc.returncode
+    if code is None or code < 0:
+        return "error", 1, b""
+    return "ok", code, bytes(out)
+
+
+def _machine_stdout(argv: list[str], cwd: str, env: dict[str, str]) -> bytes | None:
+    status, code, data = _capture_machine(argv, cwd, env)
+    # git diff/show/log/ls-files return 0 here. `--exit-code` is not passed.
+    # A non-zero status, including overflow and timeout, is an incomplete read.
+    if status != "ok" or code != 0:
+        return None
+    return data
+
+
+def _decode_z(data: bytes, *, loose: bool) -> list[str] | None:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if loose:
+        return _parse_z_names(text)
+    return _parse_z_paths(text)
+
+
+def _run_z(
+    exe: str,
+    cwd: str,
+    env: dict[str, str],
+    overrides: tuple[str, ...],
+    args: list[str],
+    *,
+    loose: bool = False,
+) -> list[str] | None:
+    data = _machine_stdout(_git_prefix(exe, overrides) + args, cwd, env)
+    if data is None:
+        return None
+    return _decode_z(data, loose=loose)
+
+
+def _repo_toplevel(
+    exe: str,
+    cwd: str,
+    env: dict[str, str],
+    overrides: tuple[str, ...],
+) -> tuple[Result | None, str]:
+    argv = _git_prefix(exe, overrides) + ["rev-parse", "--show-toplevel"]
+    result = _bounded_run(argv, cwd, env)
+    text = result.stdout
+    # One path, one trailing newline. A failed read must not be treated as
+    # "no LFS paths" (same rule as the filter-config read, including timeout).
+    if (
+        result.code != 0
+        or text == ""
+        or not text.endswith("\n")
+        or "\n" in text[:-1]
+        or "\0" in text
+        or "[safe-read:" in text
+        or LINE_MARK in text
+    ):
+        return _refused("could not list LFS paths"), ""
+    try:
+        top = os.path.realpath(text[:-1])
+    except (OSError, ValueError):
+        return _refused("could not list LFS paths"), ""
+    if top == "":
+        return _refused("could not list LFS paths"), ""
+    return None, top
+
+
+def _list_lfs_paths(
+    exe: str,
+    cwd: str,
+    env: dict[str, str],
+    overrides: tuple[str, ...],
+) -> tuple[Result | None, tuple[str, ...], str]:
+    refused, toplevel = _repo_toplevel(exe, cwd, env, overrides)
+    if refused is not None:
+        return refused, (), ""
+    # NUL reader, not the user-visible line cap. A long path list has no newline;
+    # cutting it at MAX_LINE_CHARS used to refuse every later git command.
+    paths = _run_z(
+        exe, cwd, env, overrides,
+        ["ls-files", "-z", "--full-name", "--", _LFS_LIST_SPEC],
+    )
+    if paths is None:
+        return _refused("could not list LFS paths"), (), ""
+    return None, tuple(paths), toplevel
+
+
+def _tokens_before_paths(user_args: tuple[str, ...]) -> tuple[str, ...]:
+    if "--" not in user_args:
+        return user_args
+    return user_args[: user_args.index("--")]
+
+
+def _path_args(user_args: tuple[str, ...]) -> list[str] | None:
+    """Absolute pathspecs after `--`, or None when the command has no path limit."""
+    if "--" not in user_args:
+        return None
+    return list(user_args[user_args.index("--") + 1 :])
+
+
+def _diff_is_history(user_args: tuple[str, ...]) -> bool:
+    rev: str | None = None
+    for tok in _tokens_before_paths(user_args):
+        if tok == "--cached":
+            return True
+        if not tok.startswith("-"):
+            rev = tok
+    return rev is not None and ".." in rev
+
+
+def _lfs_side(plan: Plan) -> str | None:
+    if plan.sub in ("git-status", "git-blame"):
+        return "worktree"
+    if plan.sub == "git-diff":
+        return "history" if _diff_is_history(plan.user_args) else "worktree"
+    if plan.sub in ("git-show", "git-log"):
+        return "history"
+    return None
+
+
+def _abs_in_repo(toplevel: str, rel: str) -> str:
+    try:
+        return os.path.realpath(os.path.join(toplevel, rel))
+    except (OSError, ValueError):
+        return os.path.normpath(os.path.join(toplevel, rel))
+
+
+def _matches_spec(abs_path: str, spec: str) -> bool:
+    if abs_path == spec:
+        return True
+    root = spec.rstrip(os.sep)
+    return abs_path.startswith(root + os.sep)
+
+
+def _scoped_lfs(lfs_paths: tuple[str, ...], plan: Plan, toplevel: str) -> list[str]:
+    """Literal prefix match kept for callers that already resolved a real path.
+
+    `run` does not use this for command scope. Globs are not prefixes, so scope
+    is the intersection of two `git ls-files` results instead.
+    """
+    specs = _path_args(plan.user_args)
+    if specs is None:
+        return list(lfs_paths)
+    scoped = []
+    for rel in lfs_paths:
+        abs_path = _abs_in_repo(toplevel, rel)
+        if any(_matches_spec(abs_path, spec) for spec in specs):
+            scoped.append(rel)
+    return scoped
+
+
+def _blame_lfs_path(plan: Plan, lfs_paths: tuple[str, ...], toplevel: str) -> str | None:
+    specs = _path_args(plan.user_args)
+    if not specs:
+        return None
+    target = specs[0]
+    for rel in lfs_paths:
+        if _abs_in_repo(toplevel, rel) == target:
+            return rel
+    return None
+
+
+def _with_lfs_exclude(argv: list[str]) -> list[str]:
+    if "--" in argv:
+        return [*argv, _LFS_EXCLUDE_SPEC]
+    return [*argv, "--", _LFS_EXCLUDE_SPEC]
+
+
+def _sanitize_lfs_path(path: str) -> str:
+    """Make one footer path a single line that cannot forge a `[safe-read:` marker."""
+    marker = "[safe-read:"
+    out: list[str] = []
+    i = 0
+    while i < len(path):
+        if path.startswith(marker, i):
+            out.append("[safe-read\\x3a")
+            i += len(marker)
+            continue
+        ch = path[i]
+        o = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif o < 32 or o == 127:
+            out.append(f"\\x{o:02x}")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _fmt_paths(paths: list[str]) -> str:
+    shown = [_sanitize_lfs_path(path) for path in paths]
+    if len(shown) <= 50:
+        return ", ".join(shown)
+    extra = len(shown) - 50
+    return ", ".join(shown[:50]) + f", \u2026 and {extra} more"
+
+
+_TRUNC_AT_END = re.compile(r"\[safe-read: output truncated at [^\]]+\]\n\Z")
+
+
+def _shrink_note(line: str) -> str:
+    """Leave room for the longest truncation notice beside the LFS note."""
+    reserve = len(f"[safe-read: output truncated at {LIMIT_LINES}]\n".encode("utf-8"))
+    budget = MAX_STDOUT_BYTES - reserve
+    raw = line.encode("utf-8")
+    if len(raw) <= budget:
+        return line
+    suffix = " \u2026]\n"
+    suffix_b = suffix.encode("utf-8")
+    keep = budget - len(suffix_b)
+    if keep < 0:
+        return raw[:budget].decode("utf-8", "ignore")
+    body = raw[:keep].decode("utf-8", "ignore")
+    if body.endswith("]"):
+        body = body[:-1].rstrip()
+    return body + suffix
+
+
+def _append_note(stdout: str, note: str) -> str:
+    """Append the LFS note. A truncated body keeps its truncation notice too."""
+    line = _shrink_note(note if note.endswith("\n") else note + "\n")
+    match = _TRUNC_AT_END.search(stdout)
+    if match:
+        trunc = match.group(0)
+        body = stdout[: match.start()]
+    else:
+        trunc = ""
+        body = stdout
+    if body and not body.endswith("\n"):
+        body += "\n"
+    note_b = line.encode("utf-8")
+    body_b = body.encode("utf-8", "replace")
+    if not trunc and len(body_b) + len(note_b) <= MAX_STDOUT_BYTES:
+        return body + line
+    if not trunc:
+        trunc = f"[safe-read: output truncated at {LIMIT_STDOUT}]\n"
+    trunc_b = trunc.encode("utf-8")
+    budget = MAX_STDOUT_BYTES - len(trunc_b) - len(note_b)
+    if budget < 0:
+        budget = 0
+    if len(body_b) > budget:
+        body = body_b[:budget].decode("utf-8", "ignore")
+    return body + trunc + line
+
+
+def _unquote_git(token: str) -> str | None:
+    if len(token) < 2 or not token.startswith('"') or not token.endswith('"'):
+        return None
+    body = token[1:-1]
+    out: list[str] = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        if i + 1 >= len(body):
+            return None
+        nxt = body[i + 1]
+        mapping = {
+            "n": "\n",
+            "t": "\t",
+            "r": "\r",
+            "\\": "\\",
+            '"': '"',
+            "a": "\a",
+            "b": "\b",
+            "f": "\f",
+            "v": "\v",
+        }
+        if nxt in mapping:
+            out.append(mapping[nxt])
+            i += 2
+            continue
+        if nxt in "01234567":
+            j = i + 1
+            octal: list[str] = []
+            while j < len(body) and len(octal) < 3 and body[j] in "01234567":
+                octal.append(body[j])
+                j += 1
+            try:
+                out.append(chr(int("".join(octal), 8)))
+            except ValueError:
+                return None
+            i = j
+            continue
+        return None
+    return "".join(out)
+
+
+def _take_token(text: str) -> tuple[str, str] | None:
+    if text == "":
+        return None
+    if text[0] == '"':
+        i = 1
+        while i < len(text):
+            if text[i] == "\\":
+                i += 2
+                if i > len(text):
+                    return None
+                continue
+            if text[i] == '"':
+                return text[: i + 1], text[i + 1 :]
+            i += 1
+        return None
+    end = text.find(" ")
+    if end == -1:
+        return text, ""
+    return text[:end], text[end:]
+
+
+def _decode_token(token: str) -> str | None:
+    if token.startswith('"'):
+        return _unquote_git(token)
+    return token
+
+
+def _split_diff_git(line: str) -> tuple[str, str] | None:
+    prefix = "diff --git "
+    if not line.startswith(prefix):
+        return None
+    taken = _take_token(line[len(prefix) :])
+    if taken is None:
+        return None
+    a_tok, rest = taken
+    if not rest.startswith(" "):
+        return None
+    taken = _take_token(rest[1:])
+    if taken is None:
+        return None
+    b_tok, rest = taken
+    if rest != "":
+        return None
+    a = _decode_token(a_tok)
+    b = _decode_token(b_tok)
+    if a is None or b is None or not a.startswith("a/") or not b.startswith("b/"):
+        return None
+    return a[2:], b[2:]
+
+
+def _output_mode(plan: Plan) -> str:
+    flags = [tok for tok in _tokens_before_paths(plan.user_args) if tok in ("--name-only", "--name-status", "--stat")]
+    if len(flags) > 1:
+        return "ambiguous"
+    if flags:
+        return flags[0]
+    if plan.sub == "git-log" and "-p" not in _tokens_before_paths(plan.user_args):
+        return "none"
+    return "patch"
+
+
+def _field_path(field: str) -> str | None:
+    if field.startswith('"'):
+        return _unquote_git(field)
+    return field
+
+
+def _detect_paths(stdout: str, plan: Plan) -> set[str] | None:
+    """Paths mentioned by git output. None means the set cannot be trusted."""
+    if "[safe-read:" in stdout or LINE_MARK in stdout:
+        return None
+    mode = _output_mode(plan)
+    if mode == "ambiguous":
+        return None
+    if mode == "none":
+        return set()
+    if mode == "patch":
+        return _detect_patch(stdout)
+    if mode == "--name-status":
+        return _detect_name_status(stdout)
+    if mode == "--name-only":
+        return _detect_name_only(stdout)
+    if mode == "--stat":
+        return _detect_stat(stdout)
+    return None
+
+
+def _detect_patch(stdout: str) -> set[str] | None:
+    found: set[str] = set()
+    for line in stdout.splitlines():
+        if line.startswith("diff --cc ") or line.startswith("diff --combined "):
+            return None
+        if not line.startswith("diff --git "):
+            continue
+        parsed = _split_diff_git(line)
+        if parsed is None:
+            return None
+        found.update(parsed)
+    return found
+
+
+def _detect_name_status(stdout: str) -> set[str] | None:
+    found: set[str] = set()
+    for line in stdout.splitlines():
+        if "\t" not in line:
+            continue
+        match = _NS_RE.match(line)
+        if match is None:
+            return None
+        for field in match.group(1).split("\t"):
+            path = _field_path(field)
+            if path is None:
+                return None
+            found.add(path)
+    return found
+
+
+def _detect_name_only(stdout: str) -> set[str] | None:
+    found: set[str] = set()
+    for line in stdout.splitlines():
+        if line == "" or line[0] in " \t":
+            continue
+        if line.startswith(("commit ", "Author:", "Date:", "Merge:", "tag ", "Tagger:")):
+            continue
+        path = _field_path(line)
+        if path is None:
+            return None
+        if " " in line and not line.startswith('"'):
+            return None
+        found.add(path)
+    return found
+
+
+def _detect_stat(stdout: str) -> set[str] | None:
+    found: set[str] = set()
+    for line in stdout.splitlines():
+        if not line.startswith(" ") or " | " not in line:
+            continue
+        # git --stat pads the name with spaces so the "|" column lines up.
+        path = line[1:].rsplit(" | ", 1)[0].rstrip(" ")
+        if path == "" or "=>" in path:
+            return None
+        found.add(path)
+    return found
+
+
+def _cwd_relative_output(plan: Plan) -> bool:
+    """True when git will print paths relative to cwd, not the worktree root.
+
+    `--relative` and `--relative=<path>` do that for diff/show/log. Those names
+    cannot be matched against the root-relative LFS list, so the caller lists
+    every LFS path in scope instead of trusting the parse.
+    """
+    for tok in _tokens_before_paths(plan.user_args):
+        if tok == "--relative" or tok.startswith("--relative="):
+            return True
+    return False
+
+
+def _history_note_paths(
+    stdout: str,
+    plan: Plan,
+    lfs_paths: tuple[str, ...],
+    toplevel: str,
+) -> list[str]:
+    """Formatted-output parser. `run` uses `git --name-only -z` instead of this."""
+    scoped = _scoped_lfs(lfs_paths, plan, toplevel)
+    if not scoped:
+        return []
+    if _cwd_relative_output(plan):
+        return list(scoped)
+    detected = _detect_paths(stdout, plan)
+    if detected is None:
+        return list(scoped)
+    return [rel for rel in scoped if rel in detected]
+
+
+def _prioritize_lfs(known: list[str], scoped: list[str]) -> list[str]:
+    """Known differences first (sorted), then the other in-scope paths (sorted).
+
+    Untracked paths and deletions are known without a clean or smudge filter.
+    The 50-name cap then still names them. The set of paths is unchanged.
+    """
+    first = sorted(set(known))
+    skip = set(first)
+    tail = sorted(path for path in set(scoped) if path not in skip)
+    return first + tail
+
+
+def _ls_full(
+    exe: str,
+    cwd: str,
+    env: dict[str, str],
+    overrides: tuple[str, ...],
+    specs: list[str],
+    *extra: str,
+) -> list[str] | None:
+    return _run_z(
+        exe, cwd, env, overrides,
+        ["ls-files", "-z", "--full-name", *extra, "--", *specs],
+    )
+
+
+def _head_exists(
+    exe: str,
+    cwd: str,
+    env: dict[str, str],
+    overrides: tuple[str, ...],
+) -> bool | None:
+    """True when HEAD resolves. False on an unborn branch. None when the read failed."""
+    argv = _git_prefix(exe, overrides) + ["rev-parse", "--verify", "--quiet", "HEAD"]
+    result = _bounded_run(argv, cwd, env)
+    if result.code == 0 and result.stdout.endswith("\n") and "[safe-read:" not in result.stdout:
+        return True
+    if result.code == 1 and result.stdout == "":
+        return False
+    return None
+
+
+def _staged_deleted(
+    exe: str,
+    cwd: str,
+    env: dict[str, str],
+    overrides: tuple[str, ...],
+    specs: list[str],
+) -> list[str] | None:
+    """Index and worktree deletions of paths matching specs.
+
+    `git ls-files --deleted` misses `git rm` (the path has left the index).
+    `--deleted --with-tree=HEAD` puts that path back for the deletion check and
+    also reports an unstaged `rm`. No HEAD means there is nothing to report.
+    """
+    head = _head_exists(exe, cwd, env, overrides)
+    if head is None:
+        return None
+    if not head:
+        return []
+    return _run_z(
+        exe, cwd, env, overrides,
+        ["ls-files", "-z", "--deleted", "--full-name", "--with-tree=HEAD", "--", *specs],
+    )
+
+
+def _worktree_lfs_paths(
+    exe: str,
+    cwd: str,
+    env: dict[str, str],
+    overrides: tuple[str, ...],
+    plan: Plan,
+    lfs_paths: tuple[str, ...],
+) -> list[str] | None:
+    """Tracked, untracked, and staged-deleted LFS paths the exclude hides.
+
+    None means the scope could not be evaluated. An empty list means nothing in
+    scope is hidden. Paths outside the user's pathspec are not included.
+    """
+    others = _ls_full(
+        exe, cwd, env, overrides, [_LFS_LIST_SPEC], "--others", "--exclude-standard",
+    )
+    deleted = _staged_deleted(exe, cwd, env, overrides, [_LFS_LIST_SPEC])
+    if others is None or deleted is None:
+        return None
+    specs = _path_args(plan.user_args)
+    if specs is None:
+        known = [*others, *deleted]
+        return _prioritize_lfs(known, [*lfs_paths, *known])
+    matched = _ls_full(exe, cwd, env, overrides, specs)
+    matched_others = _ls_full(
+        exe, cwd, env, overrides, specs, "--others", "--exclude-standard",
+    )
+    matched_deleted = _staged_deleted(exe, cwd, env, overrides, specs)
+    if matched is None or matched_others is None or matched_deleted is None:
+        return None
+    tracked_set = set(matched)
+    others_set = set(matched_others)
+    deleted_set = set(matched_deleted)
+    known = [path for path in others if path in others_set]
+    known.extend(path for path in deleted if path in deleted_set)
+    scoped = [path for path in lfs_paths if path in tracked_set]
+    scoped.extend(known)
+    return _prioritize_lfs(known, scoped)
+
+
+def _history_probe_args(plan: Plan) -> list[str] | None:
+    """Machine-readable names for the same revs and pathspecs. None: no content is shown."""
+    specs = _path_args(plan.user_args)
+    tokens = _tokens_before_paths(plan.user_args)
+    if plan.sub == "git-diff":
+        flags = [tok for tok in tokens if tok == "--cached"]
+        revs = [tok for tok in tokens if not tok.startswith("-")]
+        args = ["diff", *_DIFF_SAFETY, "--name-only", "-z", *flags, *revs]
+    elif plan.sub == "git-show":
+        revs = [tok for tok in tokens if not tok.startswith("-")]
+        args = ["show", *_DIFF_SAFETY, "--pretty=format:", "--name-only", "-z", *revs]
+    elif plan.sub == "git-log":
+        if "-p" not in tokens:
+            return None
+        args = ["log", *_DIFF_SAFETY, "--pretty=format:", "--name-only", "-z"]
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "-n" and i + 1 < len(tokens):
+                args.extend((tok, tokens[i + 1]))
+                i += 2
+                continue
+            if tok.startswith("-n") and tok[2:].isdigit():
+                args.append(tok)
+            i += 1
+    else:
+        return None
+    if specs:
+        args.extend(["--", *specs])
+    return args
+
+
+def _scoped_tracked(
+    exe: str,
+    cwd: str,
+    env: dict[str, str],
+    overrides: tuple[str, ...],
+    plan: Plan,
+    lfs_paths: tuple[str, ...],
+) -> list[str] | None:
+    specs = _path_args(plan.user_args)
+    if specs is None:
+        return list(lfs_paths)
+    matched = _ls_full(exe, cwd, env, overrides, specs)
+    if matched is None:
+        return None
+    selected = set(matched)
+    return [path for path in lfs_paths if path in selected]
+
+
+def _history_lfs_paths(
+    exe: str,
+    cwd: str,
+    env: dict[str, str],
+    overrides: tuple[str, ...],
+    plan: Plan,
+    lfs_paths: tuple[str, ...],
+) -> list[str]:
+    """LFS paths whose pointer text this command shows.
+
+    Names come from `git diff/show/log --name-only -z` with the same revs and
+    pathspecs, not from `--stat` or quoted diff headers. If that call fails,
+    every in-scope LFS path is listed (the set is ambiguous). Log without `-p`
+    shows no file content, so it adds no note.
+    """
+    if _history_probe_args(plan) is None:
+        return []
+    deleted = _staged_deleted(exe, cwd, env, overrides, [_LFS_LIST_SPEC])
+    known = list(lfs_paths)
+    if deleted:
+        have = set(known)
+        for path in deleted:
+            if path not in have:
+                known.append(path)
+                have.add(path)
+    probed = _run_z(
+        exe, cwd, env, overrides, _history_probe_args(plan) or [], loose=True,
+    )
+    if probed is not None:
+        wanted = set(probed)
+        return [path for path in known if path in wanted]
+    scoped = _scoped_tracked(exe, cwd, env, overrides, plan, lfs_paths)
+    if scoped is None:
+        return list(lfs_paths)
+    return scoped
+
+
+def run(plan: Plan) -> Result:
+    if plan.sub == "help":
+        return Result(0, HELP, "")
+    tool = "git" if plan.sub.startswith("git-") else plan.sub
+    exe = shutil.which(tool, path=FIXED_PATH)
+    if not exe:
+        return Result(127, "", f"safe-read: not found: {tool}\n")
+    env = _env()
+    overrides: tuple[str, ...] = ()
+    if tool == "git":
+        refused, overrides = _filters_refuse(exe, plan.cwd, env)
+        if refused is not None:
+            return refused
+    lfs_paths: tuple[str, ...] = ()
+    toplevel = ""
+    if overrides:
+        refused, lfs_paths, toplevel = _list_lfs_paths(exe, plan.cwd, env, overrides)
+        if refused is not None:
+            return refused
+    side = _lfs_side(plan)
+    if lfs_paths and plan.sub == "git-blame":
+        rel = _blame_lfs_path(plan, lfs_paths, toplevel)
+        if rel is not None:
+            return _refused(
+                f"{_sanitize_lfs_path(rel)} is LFS-tracked; blame against the worktree "
+                "is unreliable with LFS filters disabled"
+            )
+    note = ""
+    argv = _command(exe, plan, overrides)
+    if lfs_paths and side == "worktree" and plan.sub != "git-blame":
+        scoped = _worktree_lfs_paths(exe, plan.cwd, env, overrides, plan, lfs_paths)
+        if scoped is None:
+            return _refused("could not list LFS paths")
+        if scoped:
+            note = _UNRESOLVED_PREFIX + _fmt_paths(scoped) + "]"
+        argv = _with_lfs_exclude(argv)
+    elif overrides and side == "history":
+        touched = _history_lfs_paths(exe, plan.cwd, env, overrides, plan, lfs_paths)
+        if touched:
+            note = _POINTER_PREFIX + _fmt_paths(touched) + "]"
+    result = _bounded_run(argv, plan.cwd, env)
+    if note:
+        return Result(result.code, _append_note(result.stdout, note), result.stderr)
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        args: list[str] = sys.argv[1:]
+    else:
+        args = list(argv)
+    try:
+        plan = parse(args)
+    except Reject as exc:
+        print(f"safe-read: rejected: {exc.reason}", file=sys.stderr)
+        return 2
+    result = run(plan)
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    return result.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
