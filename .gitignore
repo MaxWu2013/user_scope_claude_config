@@ -17,3 +17,59 @@ channels/
 
 # no need plugins
 plugins/
+
+# Runtime state, caches, logs, and backups. Working copies stay on disk.
+projects/
+file-history/
+paste-cache/
+telemetry/
+shell-snapshots/
+sessions/
+logs/
+cache/
+ide/
+daemon/
+daemon.log
+history.jsonl
+stats-cache.json
+mcp-needs-auth-cache.json
+gh-pr-status-cache.json
+policy-limits.json*
+remote-settings.json*
+*.bak
+backup/
+backups/
+tasks/
+jobs/
+state/
+chrome
+
+# Generic runtime, log, cache, and secret patterns.
+# Exact names above stay. These cover the same kinds of files wherever they appear.
+# *.lock is omitted so a skill's yarn.lock / pubspec.lock stays visible (.oauth_refresh.lock* only).
+# /*.jsonl is repo-root only so .jsonl files inside skills/ and hooks/ stay tracked.
+*.log
+*.log.*
+*.pid
+*.sock
+*.tmp
+*.tmp.*
+*.swp
+*~
+.oauth_refresh.lock*
+.last-*
+*-cache.json
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+/*.jsonl
+todos/
+statsig/
+session-env/
+feedback/
+debug/
+downloads/
+.credentials.json
+*.key
+*.pem
