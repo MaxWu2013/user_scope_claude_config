@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Parity: looks_like_code_target matches the f39e923 baseline.
+"""Parity: looks_like_code_target matches a frozen expected table.
 
 classify_write_target now returns phase-2 classes (control, outside, state, …),
-so this file compares looks_like_code_target to the baseline instead of that
-function's code/document split.
+so this file compares looks_like_code_target to the frozen table instead of
+that function's code/document split.
+
+Baseline commit f39e923 is lost (not in ~/.claude history or origin/main).
+The table is frozen from _paths.py at commit abce16b (2026-11-04).
 """
 
 import importlib.util
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 sys.dont_write_bytecode = True
 
-BASELINE = "f39e923"
 HOOK_DIR = Path(__file__).resolve().parent
 
 PATHS = [
@@ -64,32 +64,55 @@ PATHS = [
 
 NOTEBOOK_PATHS = ["src/a.ts", "README.md", "docs/plan.txt"]
 
-
-def git_show(spec):
-    return subprocess.check_output(
-        ["git", "show", spec],
-        cwd=HOOK_DIR,
-        text=True,
-    )
-
-
-def load_baseline(tmp):
-    (tmp / "require-cursor-agent.py").write_text(
-        git_show(f"{BASELINE}:require-cursor-agent.py"),
-        encoding="utf-8",
-    )
-    (tmp / "_agent_def.py").write_text(
-        git_show(f"{BASELINE}:_agent_def.py"),
-        encoding="utf-8",
-    )
-    sys.path.insert(0, str(tmp))
-    spec = importlib.util.spec_from_file_location(
-        "baseline_require_cursor_agent",
-        tmp / "require-cursor-agent.py",
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+# Frozen from _paths.looks_like_code_target at abce16b (2026-11-04).
+# Documents are *.md / *.mdx, and non-code files under docs/. Everything else
+# is code. board.canvas and Untitled.base are code: looks_like_code_target does
+# not treat .canvas / .base as documents (vault copies are vault_structured
+# only inside _classify).
+EXPECTED = {
+    "": "code",
+    "README.md": "document",
+    "readme.MD": "document",
+    "notes.mdx": "document",
+    "a/b/c.md": "document",
+    "docs/guide.md": "document",
+    "docs/plan.txt": "document",
+    "docs/sub/dir/notes.txt": "document",
+    "docs/app.css": "code",
+    "docs/demo/index.html": "code",
+    "docs/config.yaml": "code",
+    "docs/data.json": "code",
+    "docs/Makefile": "document",
+    "src/docs/note.txt": "document",
+    "mydocs/note.txt": "code",
+    "notes.txt": "code",
+    "Makefile": "code",
+    "scripts/deploy": "code",
+    ".gitignore": "code",
+    ".env": "code",
+    "src/a.ts": "code",
+    "src/App.vue": "code",
+    "lib/a.dart": "code",
+    "a.py": "code",
+    "a.sh": "code",
+    "pubspec.yaml": "code",
+    "package.json": "code",
+    "app.gradle": "code",
+    "Info.plist": "code",
+    "x.pbxproj": "code",
+    "/abs/docs/x.txt": "document",
+    "/abs/README.md": "document",
+    "C:\\repo\\docs\\x.txt": "document",
+    "docs\\x.txt": "document",
+    "x.MD.py": "code",
+    "x.py.md": "document",
+    "board.canvas": "code",
+    "Untitled.base": "code",
+    "img.png": "code",
+    ".claude/specs/t.diff": "code",
+    "~/.claude/settings.json": "code",
+    "../other/docs/x.txt": "document",
+}
 
 
 def load_paths():
@@ -104,19 +127,17 @@ def main():
     rows = []
     failed = 0
 
-    with tempfile.TemporaryDirectory() as temporary:
-        baseline = load_baseline(Path(temporary))
-        checks = [(p, {"file_path": p}, p) for p in PATHS]
-        checks.extend(
-            (p, {"notebook_path": p}, f"{p} [notebook_path]") for p in NOTEBOOK_PATHS
-        )
-        for path, _tool_input, label in checks:
-            expected = "code" if baseline.looks_like_code_target(path) else "document"
-            actual = "code" if paths_mod.looks_like_code_target(path) else "document"
-            ok = actual == expected
-            if not ok:
-                failed += 1
-            rows.append((label, expected, actual, "PASS" if ok else "FAIL"))
+    checks = [(p, {"file_path": p}, p) for p in PATHS]
+    checks.extend(
+        (p, {"notebook_path": p}, f"{p} [notebook_path]") for p in NOTEBOOK_PATHS
+    )
+    for path, _tool_input, label in checks:
+        expected = EXPECTED[path]
+        actual = "code" if paths_mod.looks_like_code_target(path) else "document"
+        ok = actual == expected
+        if not ok:
+            failed += 1
+        rows.append((label, expected, actual, "PASS" if ok else "FAIL"))
 
     width = max(len("path"), *(len(repr(label)) for label, _, _, _ in rows))
     print(f"{'path':<{width}}  {'baseline':<10}  {'new':<10}  result")
