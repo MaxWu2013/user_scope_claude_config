@@ -5,11 +5,13 @@ Fail open: bad input, a missing _paths, or any decision error exits 0 with
 no output. Cursor is allowed before any local import. CLAUDE_ROUTING=off
 exits 0 before any local import. SystemExit is not swallowed.
 CLAUDE_ROUTING_SCOPE=pilots enforces routing for the vault and pt-zh pilots
-only when the session started outside them. File-reader and file-writer calls
-still go through decide() in a non-pilot project. all-writes also routes
-document writes in every other project. Reads outside the pilots stay quiet
-unless ~/.claude/routing-reads is on, which runs decide() for that project.
-Any other scope value leaves behavior unchanged.
+only when the session started outside them. File-reader, file-writer, and
+Explore (same rules as file-reader) still go through decide() in a non-pilot
+project. Agent spawns do too, under pilots and all-writes, even when
+routing-reads is off. all-writes also routes document writes in every other
+project. Reads outside the pilots stay quiet unless ~/.claude/routing-reads
+is on, which runs decide() for that project. Any other scope value leaves
+behavior unchanged.
 
 Routing mode is task-aware unless CLAUDE_ROUTING_MODE or ~/.claude/routing-mode
 selects strict. An unknown mode value is strict. Read routing follows
@@ -80,10 +82,15 @@ ORCH_BASH_WRITE_DENY = (
     "Give the file-writer subagent (Agent tool) the exact files and changes."
 )
 CURSOR_AGENT_DENY = "Start cursor-agent only through ~/.claude/hooks/bin/cursor-run <spec>."
+SESSION_COST_DENY = "session-cost must be invoked alone with plain arguments."
 WRITER_SEARCH_DENY = "file-writer may not search. Ask the file-reader subagent (Agent tool)."
 WRITER_READ_DENY = "file-writer may only Read documents."
 WRITER_OBSIDIAN_READ_DENY = "file-writer may not read the vault through Obsidian."
 WRITER_READ_CLASSES = {"document", "vault_structured"}
+EXPLORE_AGENT_DENY = "Explore is off in strict mode; use file-reader."
+_AGENT_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+# Frontmatter is at the top. Cap the read so a huge agent file cannot stall the hook.
+_AGENT_DEF_CAP = 65536
 
 _SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _READ_FILE_BUDGET = 10
@@ -119,6 +126,24 @@ def safe_read_re():
 
 def cursor_run_re():
     return re.compile(_home_command("cursor-run") + r"\s+" + _SAFE_ARG + r"+$")
+
+
+def session_cost_re():
+    # One plain invocation: path, then arguments with no shell metacharacters.
+    return re.compile(_home_command("session-cost") + r"\s+" + _SAFE_ARG + r"+$")
+
+
+def _hooks_binary_mentioned(raw, binary):
+    """True when raw names ~/.claude/hooks/bin/<binary> anywhere, including quotes."""
+    if not isinstance(raw, str) or raw == "":
+        return False
+    home = re.escape(os.path.expanduser("~"))
+    pattern = (
+        r"(?:~|" + home + r")/\.claude/hooks/bin/"
+        + re.escape(binary)
+        + r"(?![A-Za-z0-9._-])"
+    )
+    return re.search(pattern, raw) is not None
 
 
 def cursor_run_path():
@@ -315,6 +340,7 @@ def _log_decision(decision, reason):
         decision=decision,
         reason=reason,
         command=_LOG.get("command"),
+        extra=_LOG.get("extra"),
     )
 
 
@@ -335,15 +361,17 @@ def _arm_log(role, d, tool, ti, paths):
     _LOG["tool"] = tool
     _LOG["path"] = path
     _LOG["command"] = command
+    _LOG["extra"] = None
 
 
 def role_of(d):
     # No agent_id means the main session, including `claude --agent X`.
+    # Explore is the routed stand-in for the built-in: same rules as file-reader.
     agent_id = d.get("agent_id")
     if agent_id is None or agent_id == "":
         return "orchestrator"
     agent_type = d.get("agent_type")
-    if agent_type == "file-reader":
+    if agent_type == "file-reader" or agent_type == "Explore":
         return "file-reader"
     if agent_type == "file-writer":
         return "file-writer"
@@ -644,18 +672,37 @@ def _charge_lines(stored):
     return stored
 
 
-def _charge_read(session_id, real, span):
+def _charge_read(session_id, real, span, bucket=None):
     """Charge span, a (start, end) inclusive range. Empty when start > end.
 
     Returns (outcome, charged). outcome is True when the read is allowed,
     "lines" when it would pass the line budget, False when it would pass the
     file budget, or None on a state error. charged is the allowance totals
     when outcome is True.
+
+    bucket None charges the orchestrator counters on the session. A bucket
+    (one general-purpose agent_id) keeps its own counters under agent_reads
+    and does not share the main session's file or line totals.
     """
     charged = {}
 
     def mutator(state):
-        reads = state.get("reads")
+        target = state
+        if bucket is not None:
+            agents = state.get("agent_reads")
+            if agents is None:
+                agents = {}
+                state["agent_reads"] = agents
+            if not isinstance(agents, dict):
+                return None
+            inner = agents.get(bucket)
+            if inner is None:
+                inner = {}
+                agents[bucket] = inner
+            elif not isinstance(inner, dict):
+                return None
+            target = inner
+        reads = target.get("reads")
         if reads is None:
             reads = {}
         if not isinstance(reads, dict):
@@ -680,7 +727,7 @@ def _charge_read(session_id, real, span):
         if extra and total + extra > _READ_LINE_BUDGET:
             return "lines"
         reads[real] = _merge_ranges(previous + fresh)
-        state["reads"] = reads
+        target["reads"] = reads
         charged["lines"] = extra
         charged["budget_files"] = len(reads)
         charged["budget_lines"] = total + extra
@@ -692,11 +739,11 @@ def _charge_read(session_id, real, span):
     return outcome, None
 
 
-def _allow_read(session_id, real, ti):
+def _allow_read(session_id, real, ti, bucket=None):
     span = _read_span(ti, real)
     if span is None:
         return False, None
-    return _charge_read(session_id, real, span)
+    return _charge_read(session_id, real, span, bucket=bucket)
 
 
 def _changed_lines(tool, ti):
@@ -809,7 +856,32 @@ def handle_write(role, d, tool, ti, paths, mode, session_id):
     return 0
 
 
-def handle_read(role, tool, ti, paths, mode, session_id):
+def _general_purpose_read(d, tool, ti, paths, mode, session_id):
+    """Orchestrator read budget, counted per agent_id, with the same logging.
+
+    Task-aware Read of a routed path charges 10 files / 2000 distinct lines.
+    Over budget denies and points at file-reader. Strict denies Read, Grep
+    and Glob the same way the orchestrator does. Other sub-agents do not
+    come through here.
+    """
+    literal, real = resolve_read_target(tool, ti, paths.project_dir)
+    if read_allowed(literal, real, paths):
+        return 0
+    subject = "%s from general-purpose" % tool
+    if mode == "task-aware" and tool == "Read":
+        bucket = d.get("agent_id")
+        if not isinstance(bucket, str) or bucket == "":
+            bucket = "general-purpose"
+        outcome, charged = _allow_read(session_id, real, ti, bucket=bucket)
+        if outcome is True:
+            _log_allowance("allow-budget", charged)
+            return 0
+        if outcome == "lines":
+            return read_deny(subject, _READ_LINE_HINT)
+    return read_deny(subject)
+
+
+def handle_read(role, d, tool, ti, paths, mode, session_id):
     if role == "file-writer":
         if tool in ("Grep", "Glob"):
             return deny(WRITER_SEARCH_DENY)
@@ -819,6 +891,8 @@ def handle_read(role, tool, ti, paths, mode, session_id):
             if cls not in WRITER_READ_CLASSES:
                 return deny(WRITER_READ_DENY)
         return 0
+    if role == "other" and _agent_type(d) == "general-purpose":
+        return _general_purpose_read(d, tool, ti, paths, mode, session_id)
     if role != "orchestrator":
         return 0
     literal, real = resolve_read_target(tool, ti, paths.project_dir)
@@ -1307,7 +1381,7 @@ def handle_bash(role, d, raw, paths):
         return 0
     _LOG["command"] = raw
     if role == "file-reader":
-        if safe_read_re().match(raw):
+        if safe_read_re().match(raw) or session_cost_re().match(raw):
             return 0
         return deny(READER_BASH_DENY)
     if role == "file-writer":
@@ -1325,6 +1399,10 @@ def handle_bash(role, d, raw, paths):
             return deny(CURSOR_AGENT_DENY)
     if safe_read_re().match(raw):
         return 0
+    if session_cost_re().match(raw):
+        return 0
+    if _hooks_binary_mentioned(raw, "session-cost"):
+        return deny(SESSION_COST_DENY)
     if READ_CMD.search(_without_stdin_filters(body, scanned, paths.scrub_command)):
         return read_deny("reading files or full diffs through Bash")
     return _orch_bash_document_writes(scanned, paths)
@@ -1493,9 +1571,11 @@ def _scope_decision(data, paths):
     """"decide", "local", or "stop".
 
     "stop": the session project is a pilot, or the payload cannot be read.
-    "decide": file-reader, file-writer, or a call that touches a pilot. A
-    pilot match retargets CLAUDE_PROJECT_DIR. "local": the call stays in the
-    session project. Fail open: callers catch errors and exit 0.
+    "decide": file-reader, file-writer (Explore included, via role_of), an
+    Agent spawn, or a call that touches a pilot. A pilot match retargets
+    CLAUDE_PROJECT_DIR. "local": the call stays in the session project.
+    Agent spawns are decided even when routing-reads is off. Fail open:
+    callers catch errors and exit 0.
     """
     vaults, pilots = _scope_entries(paths.VAULT_ROOTS)
     project = paths.project_dir()
@@ -1515,6 +1595,11 @@ def _scope_decision(data, paths):
     role = role_of(data)
     if role in ("file-reader", "file-writer"):
         # Every project, not only pilot paths. Leave CLAUDE_PROJECT_DIR alone.
+        # Explore maps to file-reader, so it takes this path too.
+        return "decide"
+    if tool == "Agent":
+        # Spawn policy applies in every non-pilot project, not only when
+        # routing-reads is on and not only when the call touches a pilot.
         return "decide"
     matched = _pilot_for_call(tool, ti, paths, vaults, pilots, data)
     if matched is None:
@@ -1528,7 +1613,8 @@ def _pilot_scope_continues(data, paths):
     """True when decide() should run against the matched pilot.
 
     Fail open: callers catch errors and exit 0. A session that already
-    started inside a pilot, and any call that does not touch one, stays quiet.
+    started inside a pilot stays quiet. A call that does not touch a pilot
+    stays quiet too, except file roles and Agent spawns.
     """
     return _scope_decision(data, paths) == "decide"
 
@@ -1589,11 +1675,256 @@ def decide(d, paths):
     if tool.startswith(OBSIDIAN_PREFIX):
         return handle_obsidian(role, d, tool, tool[len(OBSIDIAN_PREFIX):], ti, paths, mode, session_id)
     if tool in READ_TOOLS:
-        return handle_read(role, tool, ti, paths, mode, session_id)
+        return handle_read(role, d, tool, ti, paths, mode, session_id)
     if tool in WRITE_TOOLS:
         return handle_write(role, d, tool, ti, paths, mode, session_id)
     if tool == "Bash":
         return handle_bash(role, d, ti.get("command") or "", paths)
+    if tool == "Agent":
+        return handle_agent(role, d, ti, mode)
+    return 0
+
+
+def opus_subagent_deny(effective, source):
+    """Name the effective model and where it came from."""
+    return (
+        'effective model %s (%s); pass model: "sonnet" (or "haiku"), '
+        "or use a pinned agent, or set CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT=1."
+        % (effective, source)
+    )
+
+
+def _model_family(text):
+    """opus, sonnet, haiku, inherit, or unknown.
+
+    inherit is the whole token. The other families match an id that contains
+    the name. opus wins when a string contains more than one family.
+    """
+    if not isinstance(text, str):
+        return "unknown"
+    low = text.strip().lower()
+    if low == "":
+        return "unknown"
+    if "opus" in low:
+        return "opus"
+    if low == "inherit":
+        return "inherit"
+    if "sonnet" in low:
+        return "sonnet"
+    if "haiku" in low:
+        return "haiku"
+    return "unknown"
+
+
+def _env_subagent_family():
+    """sonnet or haiku from CLAUDE_CODE_SUBAGENT_MODEL, else None.
+
+    An opus or unknown env value does not count: the caller falls through to
+    inherit-main. A blank value is unset.
+    """
+    raw = os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL")
+    if not isinstance(raw, str) or raw.strip() == "":
+        return None
+    family = _model_family(raw)
+    if family in ("sonnet", "haiku"):
+        return family
+    return None
+
+
+def _agent_project(d):
+    """Project whose .claude/agents directory wins over the user directory.
+
+    Payload cwd, then CLAUDE_PROJECT_DIR, then the process cwd. This matches
+    project_dir() for the env and process cwd, and also honours the cwd field
+    Claude puts on the hook payload.
+    """
+    raw_cwd = d.get("cwd") if isinstance(d, dict) else None
+    if isinstance(raw_cwd, str) and raw_cwd.strip():
+        text = os.path.expanduser(raw_cwd.strip().replace("\\", "/"))
+        if not os.path.isabs(text):
+            base = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+            text = os.path.join(base, text)
+        return os.path.realpath(text)
+    raw = os.environ.get("CLAUDE_PROJECT_DIR")
+    if isinstance(raw, str) and raw.strip():
+        return os.path.realpath(raw)
+    return os.path.realpath(os.getcwd())
+
+
+def _read_frontmatter_model(path):
+    """("ok", model or None) or ("fail", None).
+
+    None means the frontmatter closed and had no model line. A missing file
+    is the caller's concern. Unreadable, not a regular file, too large to
+    hold a closed frontmatter, or malformed frontmatter is fail.
+    """
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return "fail", None
+    if not stat.S_ISREG(info.st_mode):
+        return "fail", None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return "fail", None
+    try:
+        try:
+            blob = os.read(fd, _AGENT_DEF_CAP)
+        except OSError:
+            return "fail", None
+    finally:
+        os.close(fd)
+    text = blob.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return "fail", None
+    closing = None
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            closing = index
+            break
+    if closing is None:
+        return "fail", None
+    for line in lines[1:closing]:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key.strip() != "model":
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1].strip()
+        return "ok", value or None
+    return "ok", None
+
+
+def _from_definition_model(value, source):
+    """Map a parsed model line to (effective_model, effective_source).
+
+    An explicit inherit stays inherit-main even when the env default is
+    sonnet or haiku: the definition beats the env default. A missing model
+    line uses that env default.
+    """
+    if value is None:
+        family = _env_subagent_family()
+        if family:
+            return family, "env-default"
+        return "inherit-main", "builtin-inherit"
+    family = _model_family(value)
+    if family == "inherit":
+        return "inherit-main", source
+    if family in ("opus", "sonnet", "haiku"):
+        return family, source
+    return "unknown", source
+
+
+def _lookup_definition(subagent_type, project):
+    """(effective, source) when a project or user file exists, else None.
+
+    Project wins. A file that exists but cannot be parsed is unknown, and
+    the user file is not consulted after that.
+    """
+    if not isinstance(subagent_type, str) or not _AGENT_TYPE_RE.fullmatch(subagent_type):
+        return None
+    name = subagent_type + ".md"
+    candidates = (
+        ("project-def", os.path.join(project, ".claude", "agents", name)),
+        ("user-def", os.path.join(os.path.expanduser("~"), ".claude", "agents", name)),
+    )
+    for source, path in candidates:
+        if not os.path.lexists(path):
+            continue
+        status, value = _read_frontmatter_model(path)
+        if status != "ok":
+            return "unknown", "unknown"
+        return _from_definition_model(value, source)
+    return None
+
+
+def effective_agent_model(d, ti, subagent_type):
+    """(effective_model, effective_source) for one Agent call.
+
+    effective_model is opus, sonnet, haiku, inherit-main, or unknown.
+    effective_source is per-call, user-def, project-def, env-default,
+    builtin-inherit, or unknown. inherit-main means the hook treats the
+    spawn as the main model, which strict mode assumes is Opus.
+    """
+    raw = ti.get("model") if isinstance(ti, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        family = _model_family(raw)
+        if family == "inherit":
+            return "inherit-main", "per-call"
+        return family, "per-call"
+    found = _lookup_definition(subagent_type, _agent_project(d))
+    if found is not None:
+        return found
+    if subagent_type == "general-purpose":
+        family = _env_subagent_family()
+        if family:
+            return family, "env-default"
+    return "inherit-main", "builtin-inherit"
+
+
+def _per_call_opus(ti):
+    raw = ti.get("model") if isinstance(ti, dict) else None
+    return isinstance(raw, str) and "opus" in raw.lower()
+
+
+def _spawn_fields(ti):
+    """subagent_type, model, description logged for an Agent call.
+
+    A missing type is general-purpose. A missing model is default. The tool
+    input is not rewritten.
+    """
+    raw_type = ti.get("subagent_type")
+    if isinstance(raw_type, str) and raw_type.strip():
+        subagent_type = raw_type.strip()
+    else:
+        subagent_type = "general-purpose"
+    raw_model = ti.get("model")
+    if isinstance(raw_model, str) and raw_model.strip():
+        model = raw_model.strip()
+    else:
+        model = "default"
+    raw_desc = ti.get("description")
+    description = raw_desc if isinstance(raw_desc, str) else ""
+    return subagent_type, model, description
+
+
+def handle_agent(role, d, ti, mode):
+    """Log every Agent spawn. Strict blocks Explore and an effective Opus.
+
+    Effective Opus is per-call opus, inherit (treated as the main model), or
+    an unknown model. task-aware only logs. Never rewrites tool input. Fail
+    open: a raise in the caller exits 0. mode is already on the common record.
+    """
+    subagent_type, model, description = _spawn_fields(ti)
+    effective, source = effective_agent_model(d, ti, subagent_type)
+    extra = {
+        "subagent_type": subagent_type,
+        "model": model,
+        "description": description,
+        "effective_model": effective,
+        "effective_source": source,
+    }
+    _LOG["extra"] = extra
+    if mode != "task-aware":
+        if subagent_type == "Explore":
+            return deny(EXPLORE_AGENT_DENY)
+        blocked = effective in ("opus", "inherit-main", "unknown")
+        writer_opus = subagent_type == "file-writer" and _per_call_opus(ti)
+        if blocked and not writer_opus:
+            if os.environ.get("CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT") != "1":
+                return deny(opus_subagent_deny(effective, source))
+    append_routing_log(
+        role,
+        _agent_type(d),
+        "Agent",
+        _LOG.get("path"),
+        decision="allow-log",
+        extra=extra,
+    )
     return 0
 
 

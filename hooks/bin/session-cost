@@ -1,0 +1,1613 @@
+#!/usr/bin/env -S python3 -I
+"""Read-only session cost audit.
+
+Executor token totals and executor cost come from ccusage. This tool only
+adds what ccusage does not report: agent attribution, pin checks, and
+advisor usage. It never writes except to stdout and stderr, and it does
+not carry a price table.
+
+Advisor usage format
+--------------------
+The claude-api reference skill is not installed on this machine. Claude Code
+transcripts record the configured advisor on api-request-shape tools as
+{"type": "advisor_20260301", "name": "advisor", "model": "<model>"}
+(the Claude Code changelog refers to the same input tag, advisor_20260301).
+A call shows assistant content blocks
+{"type": "server_tool_use", "name": "advisor"} and
+{"type": "advisor_tool_result"}. message.usage.iterations[] splits the turn:
+type "advisor_message" is the advisor (its own model and token fields) and
+type "message" is an executor iteration. Whether top-level usage already
+includes those advisor iterations is decided empirically per session: compare
+top-level token fields with the non-advisor sum and with the sum of every
+iteration. That comparison, not this note, chooses the executor tokens.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+from collections import Counter
+
+sys.dont_write_bytecode = True
+
+CCUSAGE_DEFAULT = "/opt/homebrew/bin/ccusage"
+CCUSAGE_TIMEOUT_DEFAULT = 120.0
+ESTIMATED_COST_LABEL = "estimated (LiteLLM cache, scaled to ccusage total)"
+UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+AGENT_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+FLAGS = ("--json", "--no-ccusage")
+FAMILIES = ("opus", "sonnet", "haiku", "fable")
+MAX_HUMAN_LINES = 400
+COST_TOLERANCE = 1e-6
+
+USAGE = "usage: session-cost <session-uuid> [--json] [--no-ccusage]"
+
+
+class Bag:
+    __slots__ = ("input", "output", "cache_read", "cache_5m", "cache_1h", "cache_other")
+
+    def __init__(self) -> None:
+        self.input = 0
+        self.output = 0
+        self.cache_read = 0
+        self.cache_5m = 0
+        self.cache_1h = 0
+        self.cache_other = 0
+
+    def creation(self) -> int:
+        return self.cache_5m + self.cache_1h + self.cache_other
+
+    def total(self) -> int:
+        return self.input + self.output + self.creation() + self.cache_read
+
+    def key(self) -> tuple[int, int, int, int]:
+        return (self.input, self.output, self.creation(), self.cache_read)
+
+    def add(self, other: Bag) -> None:
+        self.input += other.input
+        self.output += other.output
+        self.cache_read += other.cache_read
+        self.cache_5m += other.cache_5m
+        self.cache_1h += other.cache_1h
+        self.cache_other += other.cache_other
+
+    def copy(self) -> Bag:
+        nxt = Bag()
+        nxt.add(self)
+        return nxt
+
+
+def as_int(value) -> int:
+    if isinstance(value, bool) or value is None:
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return 0
+
+
+def die(message: str) -> None:
+    print(f"session-cost: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def parse_args(argv: list[str]) -> tuple[str, bool, bool]:
+    args = argv[1:]
+    if not args:
+        die(USAGE)
+    flags: list[str] = []
+    positionals: list[str] = []
+    for arg in args:
+        if arg in FLAGS:
+            if arg in flags:
+                die(USAGE)
+            flags.append(arg)
+            continue
+        if arg.startswith("-"):
+            die(USAGE)
+        positionals.append(arg.strip())
+    if len(positionals) != 1 or not UUID_RE.match(positionals[0]):
+        die(USAGE)
+    return positionals[0], "--json" in flags, "--no-ccusage" in flags
+
+
+def cfg(config, name, default=None):
+    """Test injection only. Production calls pass config=None and never read the environment."""
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config[name] if name in config else default
+    return getattr(config, name, default)
+
+
+def real_home() -> str:
+    return pwd.getpwuid(os.getuid()).pw_dir
+
+
+def projects_root(config=None) -> str:
+    raw = cfg(config, "projects_root")
+    if raw:
+        return os.path.realpath(raw)
+    return os.path.realpath(os.path.join(real_home(), ".claude", "projects"))
+
+
+def is_under(path: str, root: str) -> bool:
+    path = os.path.realpath(path)
+    root = os.path.realpath(root)
+    return path == root or path.startswith(root + os.sep)
+
+
+def resolve_session(root: str, session_id: str) -> tuple[str, str | None]:
+    if not os.path.isdir(root):
+        die(f"projects root is not a directory: {root}")
+    valid: list[tuple[str, str | None]] = []
+    escaped = False
+    try:
+        names = os.listdir(root)
+    except OSError as exc:
+        die(f"could not list projects root: {exc}")
+    for name in names:
+        proj = os.path.join(root, name)
+        try:
+            proj_real = os.path.realpath(proj)
+        except OSError:
+            continue
+        if not is_under(proj_real, root) or not os.path.isdir(proj_real):
+            continue
+        jsonl = os.path.join(proj, session_id + ".jsonl")
+        folder = os.path.join(proj, session_id)
+        has_jsonl = os.path.lexists(jsonl)
+        has_folder = os.path.lexists(folder)
+        if not has_jsonl and not has_folder:
+            continue
+        this_escaped = False
+        for candidate in (jsonl, folder):
+            if not os.path.lexists(candidate):
+                continue
+            try:
+                real = os.path.realpath(candidate)
+            except OSError:
+                this_escaped = True
+                continue
+            if not is_under(real, root):
+                this_escaped = True
+        if this_escaped:
+            escaped = True
+            continue
+        if not has_jsonl:
+            continue
+        valid.append((os.path.realpath(jsonl), os.path.realpath(folder) if has_folder else None))
+    if escaped:
+        die("refused: real path is outside the projects root")
+    if not valid:
+        die(f"session not found: {session_id}")
+    if len(valid) != 1:
+        die(f"ambiguous session: {session_id}")
+    return valid[0]
+
+
+def warn(warnings: list[str], message: str) -> None:
+    text = message if message.startswith("WARNING:") else "WARNING: " + message
+    if text not in warnings:
+        warnings.append(text)
+
+
+def family_of(model: str | None) -> str | None:
+    if not isinstance(model, str):
+        return None
+    text = model.lower().replace("_", "-")
+    for name in FAMILIES:
+        if name in text:
+            return name
+    return None
+
+
+def read_definition_model(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    if not lines or lines[0].strip() != "---":
+        return None
+    closing = None
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            closing = index
+            break
+    if closing is None:
+        return None
+    for line in lines[1:closing]:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        if key.strip() != "model":
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1].strip()
+        return value or None
+    return None
+
+
+def expand_home(path: str, home: str | None = None) -> str:
+    """Expand a leading ~ with the real home, never with $HOME."""
+    if path == "~" or path.startswith("~/"):
+        base = home if isinstance(home, str) and home else real_home()
+        rest = "" if path == "~" else path[2:]
+        return os.path.join(base, rest) if rest else base
+    return path
+
+
+def definition_for(
+    agent_type: str | None, cwd: str | None, home: str | None = None
+) -> tuple[str | None, str | None]:
+    if not agent_type or not AGENT_TYPE_RE.match(agent_type):
+        return None, None
+    candidates = []
+    if isinstance(cwd, str) and cwd.strip():
+        candidates.append(
+            os.path.join(expand_home(cwd, home), ".claude", "agents", agent_type + ".md")
+        )
+    base = home if isinstance(home, str) and home else real_home()
+    candidates.append(os.path.join(base, ".claude", "agents", agent_type + ".md"))
+    for path in candidates:
+        if os.path.isfile(path):
+            model = read_definition_model(path)
+            if model:
+                return path, model
+    for path in candidates:
+        if os.path.isfile(path):
+            return path, None
+    return None, None
+
+
+def is_inherit(model: str | None) -> bool:
+    return isinstance(model, str) and model.strip().lower() == "inherit"
+
+
+def pin_status(built_in: bool, definition_model: str | None, executing: list[str]) -> str:
+    if built_in or not definition_model or is_inherit(definition_model):
+        return "unpinned"
+    def_family = family_of(definition_model)
+    models = [model for model in executing if model]
+    if not models:
+        return "MISMATCH"
+    for model in models:
+        if def_family and family_of(model) == def_family:
+            continue
+        if model == definition_model:
+            continue
+        return "MISMATCH"
+    return "pin_held"
+
+
+def bag_from_usage(usage: dict) -> Bag:
+    bag = Bag()
+    bag.input = as_int(usage.get("input_tokens"))
+    bag.output = as_int(usage.get("output_tokens"))
+    bag.cache_read = as_int(usage.get("cache_read_input_tokens"))
+    creation = as_int(usage.get("cache_creation_input_tokens"))
+    cache = usage.get("cache_creation")
+    hour = five = 0
+    if isinstance(cache, dict):
+        hour = as_int(cache.get("ephemeral_1h_input_tokens"))
+        five = as_int(cache.get("ephemeral_5m_input_tokens"))
+    if hour + five == creation:
+        bag.cache_1h = hour
+        bag.cache_5m = five
+    elif 0 < hour + five < creation:
+        bag.cache_1h = hour
+        bag.cache_5m = five
+        bag.cache_other = creation - hour - five
+    else:
+        bag.cache_5m = creation
+    return bag
+
+
+def empty_agent(agent_id: str) -> dict:
+    return {
+        "id": agent_id,
+        "agentType": None,
+        "description": None,
+        "parent": None,
+        "spawnDepth": 0 if agent_id == "main" else None,
+        "toolUseId": None,
+        "isBuiltIn": None,
+        "launchedWithDefaults": None,
+        "pickedEffortModel": None,
+        "cwd": None,
+        "spawn": None,
+        "models": Counter(),
+        "identity": None,
+        "definition_path": None,
+        "definition_model": None,
+        "pin": "unpinned",
+        "advisor_configured": False,
+        "advisor_tool_types": [],
+        "advisor_model": None,
+        "advisor_events": [],
+        "calls": [],
+        "assistant_without_usage": 0,
+        "iterations_on_calls": 0,
+        "executor": Bag(),
+        "advisor": Bag(),
+        "advisor_models": Counter(),
+        "executor_cost": None,
+        "advisor_cost": None,
+        "advisor_cost_source": None,
+        "matched_ccusage": 0,
+        "ccusage_includes_advisor": False,
+    }
+
+
+def content_blocks(obj: dict) -> list[dict]:
+    found = []
+    message = obj.get("message")
+    containers = []
+    if isinstance(message, dict):
+        containers.append(message.get("content"))
+    containers.append(obj.get("content"))
+    for content in containers:
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    found.append(block)
+    return found
+
+
+def note_advisor_tool(agent: dict, tool: dict) -> None:
+    name = tool.get("name")
+    kind = tool.get("type")
+    name_text = name if isinstance(name, str) else ""
+    kind_text = kind if isinstance(kind, str) else ""
+    if "advisor" not in name_text.lower() and not kind_text.lower().startswith("advisor"):
+        return
+    agent["advisor_configured"] = True
+    if kind_text and kind_text not in agent["advisor_tool_types"]:
+        agent["advisor_tool_types"].append(kind_text)
+    model = tool.get("model")
+    if isinstance(model, str) and model and not agent["advisor_model"]:
+        agent["advisor_model"] = model
+
+
+def scan_jsonl(path: str, agent: dict, warnings: list[str], stats: dict) -> None:
+    try:
+        handle = open(path, encoding="utf-8", errors="replace")
+    except OSError as exc:
+        warn(warnings, f"could not read {path}: {exc}")
+        return
+    with handle:
+        for lineno, line in enumerate(handle, 1):
+            stats["lines"] += 1
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                stats["malformed"] += 1
+                continue
+            if not isinstance(obj, dict):
+                stats["malformed"] += 1
+                continue
+            consume_record(obj, lineno, agent, warnings)
+
+
+def consume_record(obj: dict, lineno: int, agent: dict, warnings: list[str]) -> None:
+    cwd = obj.get("cwd")
+    if isinstance(cwd, str) and cwd.strip() and not agent["cwd"]:
+        agent["cwd"] = cwd
+    advisor_model = obj.get("advisorModel")
+    if isinstance(advisor_model, str) and advisor_model:
+        agent["advisor_configured"] = True
+        if not agent["advisor_model"]:
+            agent["advisor_model"] = advisor_model
+    if obj.get("type") == "attachment":
+        attachment = obj.get("attachment")
+        if isinstance(attachment, dict) and attachment.get("type") == "model":
+            identity = attachment.get("identity")
+            if isinstance(identity, dict) and agent["identity"] is None:
+                model_id = identity.get("modelId")
+                agent["identity"] = {
+                    "modelId": model_id if isinstance(model_id, str) else None,
+                    "marketingName": identity.get("marketingName")
+                    if isinstance(identity.get("marketingName"), str)
+                    else None,
+                }
+    for container_name in ("shape", "params"):
+        container = obj.get(container_name)
+        if isinstance(container, dict) and isinstance(container.get("tools"), list):
+            for tool in container["tools"]:
+                if isinstance(tool, dict):
+                    note_advisor_tool(agent, tool)
+    timestamp = obj.get("timestamp") if isinstance(obj.get("timestamp"), str) else ""
+    for block in content_blocks(obj):
+        kind = block.get("type") if isinstance(block.get("type"), str) else ""
+        name = block.get("name") if isinstance(block.get("name"), str) else ""
+        if kind == "tool_use" and name == "Agent":
+            tool_id = block.get("id") if isinstance(block.get("id"), str) else ""
+            raw_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+            if tool_id and tool_id not in agent["spawns"]:
+                model = raw_input.get("model")
+                subagent_type = raw_input.get("subagent_type")
+                description = raw_input.get("description")
+                agent["spawns"][tool_id] = {
+                    "toolUseId": tool_id,
+                    "subagent_type": subagent_type if isinstance(subagent_type, str) else None,
+                    "model": model if isinstance(model, str) else None,
+                    "description": description if isinstance(description, str) else None,
+                    "timestamp": timestamp,
+                    "parent": agent["id"],
+                }
+        advisor_named = "advisor" in name.lower() or kind.lower().startswith("advisor")
+        if advisor_named and kind in ("server_tool_use", "tool_use", "advisor_tool_result"):
+            event_id = block.get("id") or block.get("tool_use_id")
+            event_key = (kind, name, event_id if isinstance(event_id, str) and event_id else f"{lineno}")
+            if event_key not in agent["event_keys"]:
+                agent["event_keys"].add(event_key)
+                agent["advisor_events"].append({
+                    "type": kind,
+                    "name": name or None,
+                    "timestamp": timestamp or None,
+                })
+    if obj.get("type") != "assistant":
+        return
+    message = obj.get("message")
+    if not isinstance(message, dict):
+        agent["assistant_without_usage"] += 1
+        return
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        agent["assistant_without_usage"] += 1
+        return
+    message_id = message.get("id") if isinstance(message.get("id"), str) else ""
+    request_id = obj.get("requestId") if isinstance(obj.get("requestId"), str) else ""
+    if not request_id and isinstance(message.get("requestId"), str):
+        request_id = message["requestId"]
+    key = (message_id or f"line:{lineno}", request_id)
+    model = message.get("model") if isinstance(message.get("model"), str) else ""
+    record = agent["call_index"].get(key)
+    if record is None:
+        record = {
+            "message_id": message_id or None,
+            "request_id": request_id or None,
+            "timestamp": timestamp,
+            "model": model,
+            "usage": usage,
+            "agent": agent["id"],
+        }
+        agent["call_index"][key] = record
+        agent["calls"].append(record)
+        return
+    if timestamp and (not record["timestamp"] or timestamp < record["timestamp"]):
+        record["timestamp"] = timestamp
+    previous_bag = bag_from_usage(record["usage"]).key()
+    current_bag = bag_from_usage(usage).key()
+    previous_out = as_int(record["usage"].get("output_tokens"))
+    current_out = as_int(usage.get("output_tokens"))
+    # Streamed chunks share (message.id, requestId). Keep the largest output_tokens;
+    # equal output_tokens keeps the last chunk seen. The earliest timestamp stays.
+    if current_out >= previous_out:
+        record["usage"] = usage
+        if model:
+            record["model"] = model
+    elif model and not record["model"]:
+        record["model"] = model
+    if previous_bag != current_bag:
+        warn(
+            warnings,
+            f"duplicate message {message_id or key[0]} has conflicting usage; "
+            "kept the largest output_tokens",
+        )
+
+
+def load_meta(path: str, agent: dict, warnings: list[str]) -> None:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.loads(handle.read())
+    except (OSError, json.JSONDecodeError) as exc:
+        warn(warnings, f"malformed meta.json {agent['id']}: {exc}")
+        return
+    if not isinstance(payload, dict):
+        warn(warnings, f"malformed meta.json {agent['id']}: not an object")
+        return
+    for field, key in (
+        ("agentType", "agentType"),
+        ("description", "description"),
+        ("toolUseId", "toolUseId"),
+        ("pickedEffortModel", "pickedEffortModel"),
+    ):
+        value = payload.get(field)
+        if isinstance(value, str):
+            agent[key] = value
+    depth = payload.get("spawnDepth")
+    if isinstance(depth, int) and not isinstance(depth, bool):
+        agent["spawnDepth"] = depth
+    if isinstance(payload.get("isBuiltIn"), bool):
+        agent["isBuiltIn"] = payload["isBuiltIn"]
+    if isinstance(payload.get("launchedWithDefaults"), bool):
+        agent["launchedWithDefaults"] = payload["launchedWithDefaults"]
+
+
+def scan_session(jsonl_path: str, folder: str | None, warnings: list[str]) -> tuple[dict, dict]:
+    stats = {"lines": 0, "malformed": 0, "files": []}
+    agents: dict[str, dict] = {}
+
+    def make(agent_id: str) -> dict:
+        agent = empty_agent(agent_id)
+        agent["spawns"] = {}
+        agent["event_keys"] = set()
+        agent["call_index"] = {}
+        agents[agent_id] = agent
+        return agent
+
+    main = make("main")
+    stats["files"].append(jsonl_path)
+    scan_jsonl(jsonl_path, main, warnings, stats)
+    found_jsonl = set()
+    found_meta = set()
+    if folder and os.path.isdir(folder):
+        for dirpath, dirnames, filenames in os.walk(folder, followlinks=False):
+            dirnames[:] = [name for name in dirnames if name != "__pycache__"]
+            try:
+                if not is_under(os.path.realpath(dirpath), os.path.realpath(folder)):
+                    warn(warnings, f"refused directory outside the session tree: {dirpath}")
+                    dirnames[:] = []
+                    continue
+            except OSError:
+                continue
+            for name in sorted(filenames):
+                path = os.path.join(dirpath, name)
+                try:
+                    real = os.path.realpath(path)
+                except OSError:
+                    warn(warnings, f"refused unreadable path: {path}")
+                    continue
+                if not is_under(real, os.path.realpath(folder)):
+                    warn(warnings, f"refused file outside the session tree: {path}")
+                    continue
+                if name.startswith("agent-") and name.endswith(".meta.json"):
+                    agent_id = name[len("agent-"):-len(".meta.json")]
+                    found_meta.add(agent_id)
+                    agent = agents.get(agent_id) or make(agent_id)
+                    stats["files"].append(path)
+                    load_meta(path, agent, warnings)
+                elif name.endswith(".jsonl"):
+                    if name.startswith("agent-"):
+                        agent_id = name[len("agent-"):-len(".jsonl")]
+                    else:
+                        agent_id = name[: -len(".jsonl")]
+                    found_jsonl.add(agent_id)
+                    agent = agents.get(agent_id) or make(agent_id)
+                    stats["files"].append(path)
+                    scan_jsonl(path, agent, warnings, stats)
+    for agent_id in sorted(found_meta - found_jsonl):
+        warn(warnings, f"meta.json without jsonl: {agent_id}")
+    for agent_id in sorted(found_jsonl - found_meta):
+        if agent_id == "main":
+            continue
+        warn(warnings, f"jsonl without meta.json: {agent_id}")
+    return agents, stats
+
+
+def link_tree(agents: dict[str, dict], warnings: list[str]) -> None:
+    spawns = {}
+    for agent in agents.values():
+        for tool_id, spawn in agent["spawns"].items():
+            if tool_id in spawns:
+                warn(warnings, f"Agent spawn {tool_id} appears in more than one transcript")
+                continue
+            spawns[tool_id] = spawn
+    claimed = set()
+    for agent in agents.values():
+        if agent["id"] == "main":
+            continue
+        tool_id = agent.get("toolUseId")
+        spawn = spawns.get(tool_id) if isinstance(tool_id, str) else None
+        if spawn:
+            agent["parent"] = spawn["parent"]
+            agent["spawn"] = {
+                "subagent_type": spawn["subagent_type"],
+                "model": spawn["model"],
+                "description": spawn["description"],
+            }
+            claimed.add(tool_id)
+        elif tool_id:
+            warn(warnings, f"sub-agent {agent['id']} toolUseId {tool_id} has no parent Agent spawn")
+    for tool_id, spawn in spawns.items():
+        if tool_id not in claimed:
+            warn(warnings, f"Agent spawn {tool_id} has no sub-agent transcript")
+
+
+def settle_calls(agents: dict[str, dict], warnings: list[str], empirical: dict) -> None:
+    empirical.update({
+        "calls_with_iterations": 0,
+        "top_equals_executor": 0,
+        "top_equals_all": 0,
+        "advisor_iterations": 0,
+        "nonzero_advisor_iterations": 0,
+    })
+    ambiguous = 0
+    for agent in agents.values():
+        for call in agent["calls"]:
+            usage = call["usage"]
+            top = bag_from_usage(usage)
+            iterations = usage.get("iterations")
+            has_iterations = isinstance(iterations, list) and len(iterations) > 0
+            advisor = Bag()
+            executor_iters = Bag()
+            advisor_models = []
+            if has_iterations:
+                empirical["calls_with_iterations"] += 1
+                agent["iterations_on_calls"] += 1
+                for iteration in iterations:
+                    if not isinstance(iteration, dict):
+                        continue
+                    piece = bag_from_usage(iteration)
+                    kind = iteration.get("type")
+                    if kind == "advisor_message":
+                        advisor.add(piece)
+                        empirical["advisor_iterations"] += 1
+                        if piece.total() > 0:
+                            empirical["nonzero_advisor_iterations"] += 1
+                        model = iteration.get("model")
+                        if isinstance(model, str) and model:
+                            advisor_models.append(model)
+                            agent["advisor_models"][model] += 1
+                    else:
+                        executor_iters.add(piece)
+                all_iters = executor_iters.copy()
+                all_iters.add(advisor)
+                if top.key() == executor_iters.key():
+                    empirical["top_equals_executor"] += 1
+                    chosen = top
+                else:
+                    ambiguous += 1
+                    chosen = executor_iters
+                if top.key() == all_iters.key():
+                    empirical["top_equals_all"] += 1
+                call["top_includes_advisor"] = top.key() == all_iters.key() and advisor.total() > 0 and top.key() != executor_iters.key()
+            else:
+                chosen = top
+                call["top_includes_advisor"] = False
+            call["executor"] = chosen
+            call["advisor"] = advisor
+            call["advisor_models"] = advisor_models
+            call["top"] = top
+            agent["executor"].add(chosen)
+            agent["advisor"].add(advisor)
+            if call["model"]:
+                agent["models"][call["model"]] += 1
+        if agent["advisor_configured"] and agent["calls"] and agent["iterations_on_calls"] == 0:
+            warn(warnings, f"advisor configured but usage.iterations is absent ({agent['id']})")
+        saw_call = any(
+            event["type"] in ("server_tool_use", "tool_use", "advisor_tool_result")
+            for event in agent["advisor_events"]
+        )
+        saw_usage = agent["advisor"].total() > 0
+        if saw_call and not saw_usage:
+            warn(warnings, f"advisor calls seen with no advisor_message usage ({agent['id']})")
+        if saw_usage and not saw_call:
+            warn(warnings, f"advisor_message usage seen with no advisor call ({agent['id']})")
+    if ambiguous:
+        warn(
+            warnings,
+            "top-level usage does not equal the non-advisor iteration sum on "
+            f"{ambiguous} call(s); executor tokens taken from the non-advisor sum",
+        )
+
+
+def apply_pins(agents: dict[str, dict], home: str | None = None) -> None:
+    for agent in agents.values():
+        built_in = agent["isBuiltIn"] is True
+        executing = list(agent["models"].keys())
+        if agent["id"] == "main":
+            agent["pin"] = "unpinned"
+            continue
+        path, model = definition_for(agent.get("agentType"), agent.get("cwd"), home)
+        agent["definition_path"] = path
+        agent["definition_model"] = model
+        agent["pin"] = pin_status(built_in, model, executing)
+
+
+def ccusage_timeout(config=None) -> float:
+    raw = cfg(config, "ccusage_timeout")
+    if raw is None:
+        return CCUSAGE_TIMEOUT_DEFAULT
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return CCUSAGE_TIMEOUT_DEFAULT
+    if value > 0:
+        return value
+    return CCUSAGE_TIMEOUT_DEFAULT
+
+
+def ccusage_binary(config=None) -> str:
+    raw = cfg(config, "ccusage")
+    if isinstance(raw, str) and raw:
+        return raw
+    return CCUSAGE_DEFAULT
+
+
+def run_ccusage(session_id: str, warnings: list[str], config=None) -> dict | None:
+    binary = ccusage_binary(config)
+    if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+        warn(warnings, f"ccusage unavailable (missing {binary}); scanner-only results")
+        return None
+    command = [binary, "claude", "session", "--id", session_id, "--mode", "calculate", "--json"]
+    try:
+        completed = subprocess.run(
+            command,
+            shell=False,
+            timeout=ccusage_timeout(config),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        warn(warnings, "ccusage unavailable (timed out); scanner-only results")
+        return None
+    except OSError as exc:
+        warn(warnings, f"ccusage unavailable ({exc}); scanner-only results")
+        return None
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip().splitlines()
+        suffix = detail[-1][:200] if detail else f"exit {completed.returncode}"
+        warn(warnings, f"ccusage unavailable (failed: {suffix}); scanner-only results")
+        return None
+    payload = parse_ccusage_json(completed.stdout)
+    if payload is None:
+        warn(warnings, "ccusage unavailable (response was not JSON); scanner-only results")
+        return None
+    return payload
+
+
+def parse_ccusage_json(text: str) -> dict | None:
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        if start < 0:
+            return None
+        try:
+            payload, _end = json.JSONDecoder().raw_decode(text[start:])
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def find_pricing_file(config=None) -> str | None:
+    override = cfg(config, "pricing_cache")
+    if override is not None:
+        return override if isinstance(override, str) and os.path.isfile(override) else None
+    directory = os.path.join(real_home(), ".cache", "ccusage", "http-cache")
+    if not os.path.isdir(directory):
+        return None
+    matches = []
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return None
+    for name in names:
+        lower = name.lower()
+        if "litellm" in lower or "model_prices" in lower:
+            path = os.path.join(directory, name)
+            if os.path.isfile(path):
+                try:
+                    matches.append((os.path.getmtime(path), path))
+                except OSError:
+                    continue
+    if not matches:
+        return None
+    matches.sort()
+    return matches[-1][1]
+
+
+def load_pricing(warnings: list[str], config=None) -> tuple[dict | None, str | None]:
+    path = find_pricing_file(config)
+    if not path:
+        return None, None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError:
+        return None, path
+    payload = None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        if start >= 0:
+            try:
+                payload = json.loads(text[start:])
+            except json.JSONDecodeError:
+                payload = None
+    if not isinstance(payload, dict):
+        warn(warnings, "advisor cost unavailable (pricing cache is not a JSON object)")
+        return None, path
+    return payload, path
+
+
+def lookup_price(table: dict, model: str | None) -> dict | None:
+    if not model:
+        return None
+    direct = table.get(model)
+    if isinstance(direct, dict) and isinstance(direct.get("input_cost_per_token"), (int, float)):
+        return direct
+    suffix_hits = []
+    for key, value in table.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        if key.endswith("/" + model) or key.endswith(":" + model):
+            if isinstance(value.get("input_cost_per_token"), (int, float)):
+                suffix_hits.append(value)
+    if len(suffix_hits) == 1:
+        return suffix_hits[0]
+    return None
+
+
+def rate(entry: dict, key: str) -> float | None:
+    value = entry.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def price_bag(model: str | None, bag: Bag, table: dict | None) -> float | None:
+    if table is None or bag.total() == 0:
+        return 0.0 if bag.total() == 0 else None
+    entry = lookup_price(table, model)
+    if entry is None:
+        return None
+    input_rate = rate(entry, "input_cost_per_token")
+    output_rate = rate(entry, "output_cost_per_token")
+    read_rate = rate(entry, "cache_read_input_token_cost")
+    create_rate = rate(entry, "cache_creation_input_token_cost")
+    hour_rate = rate(entry, "cache_creation_input_token_cost_above_1hr")
+    if input_rate is None or output_rate is None:
+        return None
+    if bag.cache_read and read_rate is None:
+        return None
+    if bag.cache_5m + bag.cache_other and create_rate is None:
+        return None
+    if bag.cache_1h and hour_rate is None and create_rate is None:
+        return None
+    hour = hour_rate if hour_rate is not None else create_rate
+    write = create_rate or 0.0
+    return (
+        bag.input * input_rate
+        + bag.output * output_rate
+        + bag.cache_read * (read_rate or 0.0)
+        + (bag.cache_5m + bag.cache_other) * write
+        + bag.cache_1h * (hour or 0.0)
+    )
+
+
+def price_advisor_call(call: dict, agent: dict, table: dict | None) -> float | None:
+    usage = call["usage"]
+    iterations = usage.get("iterations")
+    if not isinstance(iterations, list):
+        return 0.0
+    total = 0.0
+    priced = False
+    for iteration in iterations:
+        if not isinstance(iteration, dict) or iteration.get("type") != "advisor_message":
+            continue
+        piece = bag_from_usage(iteration)
+        if piece.total() == 0:
+            continue
+        model = iteration.get("model") if isinstance(iteration.get("model"), str) else None
+        if not model:
+            model = agent.get("advisor_model")
+        cost = price_bag(model, piece, table)
+        if cost is None:
+            return None
+        total += cost
+        priced = True
+    if not priced:
+        return 0.0
+    return total
+
+
+def join_ccusage(agents: dict[str, dict], payload: dict, table: dict | None, warnings: list[str]) -> dict:
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        entries = []
+    total_cost = payload.get("totalCost")
+    total_tokens = payload.get("totalTokens")
+    if isinstance(total_cost, bool) or not isinstance(total_cost, (int, float)):
+        total_cost = None
+    if isinstance(total_tokens, bool) or not isinstance(total_tokens, (int, float)):
+        total_tokens = None
+    parsed = []
+    entry_cost_sum = 0.0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        tokens = (
+            as_int(entry.get("inputTokens")),
+            as_int(entry.get("outputTokens")),
+            as_int(entry.get("cacheCreationTokens")),
+            as_int(entry.get("cacheReadTokens")),
+        )
+        cost = entry.get("costUSD")
+        if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+            cost = 0.0
+        entry_cost_sum += float(cost)
+        parsed.append({
+            "timestamp": entry.get("timestamp") if isinstance(entry.get("timestamp"), str) else "",
+            "model": entry.get("model") if isinstance(entry.get("model"), str) else "",
+            "tokens": tokens,
+            "cost": float(cost),
+            "matched": False,
+            "includes_advisor": False,
+        })
+    use_entry_cost = total_cost is not None and abs(entry_cost_sum - float(total_cost)) <= max(
+        COST_TOLERANCE, abs(float(total_cost)) * 1e-6
+    )
+    if total_cost is not None and not use_entry_cost:
+        warn(
+            warnings,
+            "ccusage entry costUSD sums to "
+            f"{entry_cost_sum:.6g} but totalCost is {float(total_cost):.6g}; "
+            "per-agent executor cost recomputed from ccusage cached LiteLLM prices",
+        )
+        if table is None:
+            warn(warnings, "advisor cost unavailable (needed the pricing cache to split executor cost too)")
+
+    by_executor: dict[tuple, list] = {}
+    by_top: dict[tuple, list] = {}
+    for agent in agents.values():
+        for call in agent["calls"]:
+            exec_key = (call["timestamp"], call["model"], call["executor"].key())
+            top_key = (call["timestamp"], call["model"], call["top"].key())
+            by_executor.setdefault(exec_key, []).append(call)
+            if top_key != exec_key:
+                by_top.setdefault(top_key, []).append(call)
+
+    def take(bucket: list | None):
+        while bucket:
+            found = bucket.pop(0)
+            if not found.get("joined"):
+                found["joined"] = True
+                return found
+        return None
+
+    unmatched_cost = 0.0
+    unmatched_entries = 0
+    includes_advisor = False
+    recomputed_sum = 0.0
+    pricing_failed = False
+    for entry in parsed:
+        key = (entry["timestamp"], entry["model"], entry["tokens"])
+        via_top = False
+        call = take(by_executor.get(key))
+        if call is None:
+            call = take(by_top.get(key))
+            via_top = call is not None
+        if call is None:
+            unmatched_entries += 1
+            if use_entry_cost:
+                unmatched_cost += entry["cost"]
+            elif table is not None:
+                rough = Bag()
+                rough.input, rough.output, rough.cache_5m, rough.cache_read = entry["tokens"]
+                priced = price_bag(entry["model"], rough, table)
+                if priced is None:
+                    unmatched_cost = None
+                elif unmatched_cost is not None:
+                    unmatched_cost += priced
+            else:
+                unmatched_cost = None
+            continue
+        entry["matched"] = True
+        agent = agents[call["agent"]]
+        agent["matched_ccusage"] += 1
+        if via_top:
+            entry["includes_advisor"] = True
+            includes_advisor = True
+            agent["ccusage_includes_advisor"] = True
+        if use_entry_cost:
+            cost = entry["cost"]
+        else:
+            cost = price_bag(call["model"], call["executor"], table) if not via_top else price_bag(
+                call["model"], call["top"], table
+            )
+            if cost is None:
+                agent["executor_unpriced"] = True
+                agent["executor_cost"] = None
+                pricing_failed = True
+                continue
+        if agent.get("executor_unpriced"):
+            continue
+        if agent["executor_cost"] is None:
+            agent["executor_cost"] = 0.0
+        agent["executor_cost"] += cost
+        recomputed_sum += cost
+    scale_factor = None
+    if use_entry_cost:
+        for agent in agents.values():
+            if isinstance(agent.get("executor_cost"), float):
+                agent["executor_cost_label"] = "ccusage"
+    elif (
+        total_cost is not None
+        and table is not None
+        and unmatched_cost is not None
+        and not pricing_failed
+    ):
+        raw_total = recomputed_sum + unmatched_cost
+        if raw_total > 0:
+            scale_factor = float(total_cost) / raw_total
+            priced = [
+                agent
+                for agent in agents.values()
+                if isinstance(agent.get("executor_cost"), float) and not agent.get("executor_unpriced")
+            ]
+            scaled_values = [agent["executor_cost"] * scale_factor for agent in priced]
+            unmatched_scaled = unmatched_cost * scale_factor
+            drift = float(total_cost) - (sum(scaled_values) + unmatched_scaled)
+            if unmatched_cost:
+                unmatched_scaled += drift
+            elif scaled_values:
+                scaled_values[-1] += drift
+            for agent, value in zip(priced, scaled_values):
+                agent["executor_cost"] = value
+                agent["executor_cost_label"] = ESTIMATED_COST_LABEL
+            unmatched_cost = unmatched_scaled
+    if includes_advisor:
+        warn(
+            warnings,
+            "ccusage tokens include advisor tokens (join matched top-level usage, not the "
+            "executor split); advisor cost is not added on top",
+        )
+    if (
+        total_cost is not None
+        and not use_entry_cost
+        and table is not None
+        and unmatched_cost is not None
+        and not pricing_failed
+        and scale_factor is None
+    ):
+        if abs(recomputed_sum + unmatched_cost - float(total_cost)) > max(
+            1e-4, abs(float(total_cost)) * 1e-4
+        ):
+            warn(
+                warnings,
+                "recomputed per-agent executor cost "
+                f"{recomputed_sum:.6g} does not match ccusage totalCost {float(total_cost):.6g}",
+            )
+    scanner_tokens = sum(agent["executor"].total() for agent in agents.values())
+    if total_tokens is not None and int(total_tokens) != scanner_tokens:
+        warn(
+            warnings,
+            f"scanner executor tokens {scanner_tokens} differ from ccusage totalTokens {int(total_tokens)}",
+        )
+    return {
+        "available": True,
+        "totalCost": None if total_cost is None else float(total_cost),
+        "totalTokens": None if total_tokens is None else int(total_tokens),
+        "entries": len(parsed),
+        "unmatched_entries": unmatched_entries,
+        "unmatched_cost": unmatched_cost,
+        "entry_cost_sum": entry_cost_sum,
+        "used_entry_cost": use_entry_cost,
+        "includes_advisor": includes_advisor,
+        "scanner_tokens": scanner_tokens,
+        "scale_factor": scale_factor,
+        "per_agent_cost_label": ESTIMATED_COST_LABEL if scale_factor is not None else (
+            "ccusage" if use_entry_cost else None
+        ),
+    }
+
+
+def apply_advisor_costs(agents: dict[str, dict], table: dict | None, pricing_path: str | None, warnings: list[str]) -> None:
+    any_tokens = False
+    missing = False
+    for agent in agents.values():
+        if agent["advisor"].total() == 0:
+            agent["advisor_cost"] = 0.0
+            agent["advisor_cost_source"] = "no advisor_message tokens"
+            continue
+        any_tokens = True
+        if table is None:
+            agent["advisor_cost"] = None
+            agent["advisor_cost_source"] = "unavailable"
+            missing = True
+            continue
+        total = 0.0
+        failed = False
+        for call in agent["calls"]:
+            cost = price_advisor_call(call, agent, table)
+            if cost is None:
+                failed = True
+                break
+            total += cost
+        if failed:
+            agent["advisor_cost"] = None
+            agent["advisor_cost_source"] = "unavailable"
+            missing = True
+        else:
+            agent["advisor_cost"] = total
+            agent["advisor_cost_source"] = pricing_path or "ccusage LiteLLM cache"
+    if any_tokens and missing:
+        warn(warnings, "advisor cost unavailable (model missing from ccusage LiteLLM cache or cache unreadable)")
+
+
+def money(value) -> str:
+    if value is None:
+        return "unavailable"
+    return "$" + format(float(value), ".12g")
+
+
+def grouped(value: int) -> str:
+    return f"{value:,}"
+
+
+def bag_text(bag: Bag) -> str:
+    return (
+        f"in={grouped(bag.input)} out={grouped(bag.output)} "
+        f"cache_create={grouped(bag.creation())} "
+        f"(5m={grouped(bag.cache_5m)} 1h={grouped(bag.cache_1h)}) "
+        f"cache_read={grouped(bag.cache_read)} total={grouped(bag.total())}"
+    )
+
+
+def empirical_conclusion(empirical: dict) -> str:
+    """State a fold conclusion only when a non-zero advisor_message exists."""
+    if empirical.get("nonzero_advisor_iterations", 0) <= 0:
+        return (
+            "whether top-level usage includes advisor tokens is "
+            "undetermined for this session (no advisor iterations)."
+        )
+    calls = empirical["calls_with_iterations"]
+    if empirical["top_equals_executor"] == calls and empirical["top_equals_all"] == calls:
+        return (
+            "top-level usage matches the executor iterations and the sum of every iteration."
+        )
+    if empirical["top_equals_executor"] == calls:
+        return (
+            "top-level usage matches executor iterations only. "
+            "advisor_message tokens are outside top-level usage, so they are not double-counted."
+        )
+    if empirical["top_equals_all"] == calls:
+        return (
+            "top-level usage matches the sum of every iteration, "
+            "including advisor_message. Executor tokens are the non-advisor sum."
+        )
+    return (
+        "top-level usage does not follow one pattern. "
+        "Executor tokens are the non-advisor sum where those differ."
+    )
+
+
+def empirical_text(empirical: dict) -> list[str]:
+    calls = empirical["calls_with_iterations"]
+    conclusion = "  Conclusion: " + empirical_conclusion(empirical)
+    if calls == 0:
+        return [
+            "Empirical",
+            "  No API call in this session has message.usage.iterations.",
+            conclusion,
+        ]
+    lines = [
+        "Empirical",
+        f"  Calls with usage.iterations: {calls}",
+        "  Top-level equals the non-advisor iteration sum: "
+        f"{empirical['top_equals_executor']}/{calls}",
+        "  Top-level equals the sum of all iterations: "
+        f"{empirical['top_equals_all']}/{calls}",
+        f"  advisor_message iterations: {empirical['advisor_iterations']}",
+    ]
+    if empirical["advisor_iterations"] == 0:
+        lines.append("  No call has an advisor_message iteration.")
+    lines.append(conclusion)
+    return lines
+
+
+def ordered_agents(agents: dict[str, dict]) -> list[dict]:
+    by_parent: dict[str | None, list[dict]] = {}
+    for agent in agents.values():
+        parent = None if agent["id"] == "main" else agent.get("parent")
+        by_parent.setdefault(parent, []).append(agent)
+
+    def depth_key(agent: dict) -> tuple:
+        depth = agent["spawnDepth"]
+        if not isinstance(depth, int):
+            depth = 99
+        return (depth, agent["id"])
+
+    ordered = []
+
+    def walk(agent_id: str | None) -> None:
+        children = by_parent.get(agent_id, [])
+        children.sort(key=depth_key)
+        for agent in children:
+            ordered.append(agent)
+            walk(agent["id"])
+
+    walk(None)
+    seen = {agent["id"] for agent in ordered}
+    for agent in sorted(agents.values(), key=lambda item: item["id"]):
+        if agent["id"] not in seen:
+            ordered.append(agent)
+    return ordered
+
+
+def render_agent(agent: dict, ccusage_info: dict | None) -> list[str]:
+    depth = agent["spawnDepth"] if isinstance(agent["spawnDepth"], int) else "?"
+    parent = agent["parent"] or ("-" if agent["id"] == "main" else "unknown")
+    kind = agent["agentType"] or ("main" if agent["id"] == "main" else "unknown")
+    lines = [
+        f"  {agent['id']}  type={kind}  depth={depth}  parent={parent}  pin={agent['pin']}",
+    ]
+    if agent["description"]:
+        lines.append(f"    description: {agent['description']}")
+    if agent["toolUseId"]:
+        lines.append(f"    toolUseId: {agent['toolUseId']}")
+    if agent["pickedEffortModel"]:
+        lines.append(
+            f"    pickedEffortModel: {agent['pickedEffortModel']} "
+            "(not the executing model)"
+        )
+    if agent["isBuiltIn"] is not None:
+        lines.append(
+            f"    isBuiltIn: {agent['isBuiltIn']}  launchedWithDefaults: {agent['launchedWithDefaults']}"
+        )
+    if agent["spawn"]:
+        lines.append(
+            "    spawn input: subagent_type="
+            f"{agent['spawn'].get('subagent_type')} model={agent['spawn'].get('model')}"
+        )
+    if agent["definition_model"]:
+        lines.append(
+            f"    definition model: {agent['definition_model']} ({agent['definition_path']})"
+        )
+    if agent["identity"]:
+        lines.append(
+            "    identity: "
+            f"{agent['identity'].get('modelId')} ({agent['identity'].get('marketingName')})"
+        )
+    if agent["models"]:
+        parts = [f"{model} x{count}" for model, count in sorted(agent["models"].items())]
+        lines.append("    executing: " + ", ".join(parts))
+    else:
+        lines.append("    executing: (no assistant usage)")
+    lines.append(f"    executor tokens: {bag_text(agent['executor'])}")
+    cost_source = agent.get("executor_cost_label")
+    if not cost_source:
+        if not ccusage_info:
+            cost_source = "unavailable (ccusage not used)"
+        elif agent["executor_cost"] is None:
+            cost_source = "unavailable"
+        else:
+            cost_source = "ccusage"
+    lines.append(f"    executor cost: {money(agent['executor_cost'])}  source: {cost_source}")
+    configured = "yes" if agent["advisor_configured"] else "no"
+    tools = ",".join(agent["advisor_tool_types"]) or "-"
+    lines.append(
+        f"    advisor configured: {configured}  tools: {tools}  advisorModel: {agent['advisor_model']}"
+    )
+    if agent["advisor_events"]:
+        lines.append(f"    advisor events: {len(agent['advisor_events'])}")
+        for event in agent["advisor_events"][:8]:
+            lines.append(
+                f"      {event['timestamp'] or '-'}  {event['type']}  {event['name'] or '-'}"
+            )
+        if len(agent["advisor_events"]) > 8:
+            lines.append(f"      ... {len(agent['advisor_events']) - 8} more")
+    else:
+        lines.append("    advisor events: 0")
+    model_bits = ",".join(sorted(agent["advisor_models"])) or "-"
+    lines.append(f"    advisor tokens: {bag_text(agent['advisor'])}  models: {model_bits}")
+    lines.append(
+        f"    advisor cost: {money(agent['advisor_cost'])}  source: {agent['advisor_cost_source']}"
+    )
+    return lines
+
+
+def session_costs(agents: dict[str, dict], ccusage_info: dict | None) -> dict:
+    advisor_tokens = Bag()
+    advisor_cost = 0.0
+    advisor_known = True
+    includes = False
+    for agent in agents.values():
+        advisor_tokens.add(agent["advisor"])
+        if agent["ccusage_includes_advisor"]:
+            includes = True
+        if agent["advisor"].total() == 0:
+            continue
+        if agent["advisor_cost"] is None:
+            advisor_known = False
+        elif advisor_cost is not None:
+            advisor_cost += agent["advisor_cost"]
+    if not advisor_known:
+        advisor_cost = None
+    if ccusage_info and ccusage_info.get("totalCost") is not None:
+        executor_cost = ccusage_info["totalCost"]
+        executor_source = "ccusage --mode calculate totalCost"
+    else:
+        executor_cost = None
+        executor_source = "unavailable (ccusage not used)"
+    if includes:
+        combined = executor_cost
+        combined_source = (
+            "executor only; advisor cost is not added because ccusage already counted "
+            "advisor tokens at the executor model rate"
+        )
+    elif advisor_cost is None and advisor_tokens.total() > 0:
+        combined = None
+        combined_source = "incomplete; advisor cost unavailable"
+    elif executor_cost is None:
+        combined = advisor_cost if advisor_tokens.total() else None
+        combined_source = "scanner-only"
+    else:
+        combined = executor_cost + (advisor_cost or 0.0)
+        combined_source = "executor (ccusage) + advisor (cached LiteLLM prices)"
+    return {
+        "executor_cost": executor_cost,
+        "executor_source": executor_source,
+        "advisor_cost": 0.0 if advisor_tokens.total() == 0 else advisor_cost,
+        "advisor_source": "no advisor_message tokens" if advisor_tokens.total() == 0 else (
+            "ccusage LiteLLM cache" if advisor_cost is not None else "unavailable"
+        ),
+        "advisor_tokens": advisor_tokens,
+        "combined": combined,
+        "combined_source": combined_source,
+        "includes_advisor_in_ccusage": includes,
+    }
+
+
+def public_agent(agent: dict) -> dict:
+    return {
+        "id": agent["id"],
+        "agentType": agent["agentType"],
+        "description": agent["description"],
+        "parent": agent["parent"],
+        "spawnDepth": agent["spawnDepth"],
+        "toolUseId": agent["toolUseId"],
+        "isBuiltIn": agent["isBuiltIn"],
+        "launchedWithDefaults": agent["launchedWithDefaults"],
+        "pickedEffortModel": agent["pickedEffortModel"],
+        "spawn": agent["spawn"],
+        "models": dict(agent["models"]),
+        "identity": agent["identity"],
+        "definition_path": agent["definition_path"],
+        "definition_model": agent["definition_model"],
+        "pin": agent["pin"],
+        "advisor": {
+            "configured": agent["advisor_configured"],
+            "tool_types": agent["advisor_tool_types"],
+            "advisor_model": agent["advisor_model"],
+            "events": agent["advisor_events"],
+            "tokens": {
+                "input": agent["advisor"].input,
+                "output": agent["advisor"].output,
+                "cache_creation": agent["advisor"].creation(),
+                "cache_read": agent["advisor"].cache_read,
+                "total": agent["advisor"].total(),
+            },
+            "models": dict(agent["advisor_models"]),
+            "cost": agent["advisor_cost"],
+            "cost_source": agent["advisor_cost_source"],
+        },
+        "executor": {
+            "tokens": {
+                "input": agent["executor"].input,
+                "output": agent["executor"].output,
+                "cache_creation": agent["executor"].creation(),
+                "cache_read": agent["executor"].cache_read,
+                "total": agent["executor"].total(),
+            },
+            "cost": agent["executor_cost"],
+            "cost_label": agent.get("executor_cost_label"),
+            "calls": len(agent["calls"]),
+            "ccusage_includes_advisor_tokens": agent["ccusage_includes_advisor"],
+        },
+    }
+
+
+def build_report(
+    session_id: str,
+    agents: dict[str, dict],
+    stats: dict,
+    warnings: list[str],
+    empirical: dict,
+    ccusage_info: dict | None,
+    pricing_path: str | None,
+) -> dict:
+    totals = session_costs(agents, ccusage_info)
+    without_usage = sum(agent["assistant_without_usage"] for agent in agents.values())
+    if stats["malformed"]:
+        warn(warnings, f"{stats['malformed']} malformed line(s)")
+    if without_usage:
+        warn(warnings, f"{without_usage} assistant line(s) without usage")
+    calls = sum(len(agent["calls"]) for agent in agents.values())
+    return {
+        "sessionId": session_id,
+        "empirical": {
+            "calls_with_iterations": empirical["calls_with_iterations"],
+            "top_equals_executor": empirical["top_equals_executor"],
+            "top_equals_all": empirical["top_equals_all"],
+            "advisor_iterations": empirical["advisor_iterations"],
+            "nonzero_advisor_iterations": empirical.get("nonzero_advisor_iterations", 0),
+            "conclusion": empirical_conclusion(empirical),
+            "text": empirical_text(empirical),
+        },
+        "agents": [public_agent(agent) for agent in ordered_agents(agents)],
+        "ccusage": ccusage_info,
+        "pricing_cache": pricing_path,
+        "totals": {
+            "executor_cost": totals["executor_cost"],
+            "executor_cost_source": totals["executor_source"],
+            "advisor_cost": totals["advisor_cost"],
+            "advisor_cost_source": totals["advisor_source"],
+            "advisor_tokens": totals["advisor_tokens"].total(),
+            "combined_cost": totals["combined"],
+            "combined_cost_source": totals["combined_source"],
+            "ccusage_includes_advisor_tokens": totals["includes_advisor_in_ccusage"],
+            "scanner_executor_tokens": sum(agent["executor"].total() for agent in agents.values()),
+            "ccusage_total_tokens": None if not ccusage_info else ccusage_info.get("totalTokens"),
+            "unmatched_ccusage_entries": None if not ccusage_info else ccusage_info.get("unmatched_entries"),
+            "unmatched_ccusage_cost": None if not ccusage_info else ccusage_info.get("unmatched_cost"),
+            "per_agent_cost_label": None if not ccusage_info else ccusage_info.get("per_agent_cost_label"),
+            "executor_cost_scale": None if not ccusage_info else ccusage_info.get("scale_factor"),
+        },
+        "coverage": {
+            "files": stats["files"],
+            "lines": stats["lines"],
+            "malformed_lines": stats["malformed"],
+            "calls": calls,
+            "assistant_without_usage": without_usage,
+            "warnings": len(warnings),
+        },
+        "warnings": warnings,
+    }
+
+
+def render_human(report: dict) -> str:
+    totals = report["totals"]
+    ccusage_info = report["ccusage"]
+    lines = [
+        f"Session {report['sessionId']}",
+        "",
+    ]
+    lines.extend(report["empirical"]["text"])
+    lines.append("")
+    lines.append("Agent tree")
+    lines.extend(report.get("human_agents") or [])
+    lines.append("")
+    lines.append("Totals")
+    lines.append(
+        f"  executor cost: {money(totals['executor_cost'])}  source: {totals['executor_cost_source']}"
+    )
+    lines.append(
+        f"  advisor cost: {money(totals['advisor_cost'])}  source: {totals['advisor_cost_source']}"
+    )
+    lines.append(
+        f"  combined: {money(totals['combined_cost'])}  source: {totals['combined_cost_source']}"
+    )
+    ccusage_tokens = totals["ccusage_total_tokens"]
+    lines.append(
+        "  ccusage totalTokens: "
+        + ("unavailable" if ccusage_tokens is None else grouped(int(ccusage_tokens)))
+    )
+    lines.append(f"  scanner executor tokens: {grouped(int(totals['scanner_executor_tokens']))}")
+    unmatched = totals["unmatched_ccusage_entries"]
+    lines.append(
+        "  unmatched ccusage entries: "
+        + ("unavailable" if unmatched is None else str(unmatched))
+        + f"  remainder: {money(totals['unmatched_ccusage_cost'])}"
+    )
+    if report.get("pricing_cache"):
+        lines.append(f"  advisor pricing cache: {report['pricing_cache']}")
+    else:
+        lines.append("  advisor pricing cache: unavailable")
+    if ccusage_info and ccusage_info.get("scale_factor") is not None:
+        lines.append(
+            "  per-agent executor cost: estimated (LiteLLM cache, scaled to ccusage total)"
+        )
+        lines.append(f"  scale factor: {format(float(ccusage_info['scale_factor']), '.12g')}")
+        lines.append("  The session executor total above is still ccusage totalCost.")
+    lines.append("")
+    coverage = report["coverage"]
+    lines.append("Coverage")
+    lines.append(f"  files: {len(coverage['files'])}")
+    for path in coverage["files"]:
+        lines.append(f"    {path}")
+    lines.append(f"  lines: {grouped(coverage['lines'])}")
+    lines.append(f"  calls: {grouped(coverage['calls'])}")
+    lines.append(f"  malformed lines: {coverage['malformed_lines']}")
+    lines.append(f"  assistant lines without usage: {coverage['assistant_without_usage']}")
+    lines.append(f"  warnings: {coverage['warnings']}")
+    lines.append("")
+    lines.append("Warnings")
+    if report["warnings"]:
+        lines.extend(f"  {item}" for item in report["warnings"])
+    else:
+        lines.append("  (none)")
+    if len(lines) > MAX_HUMAN_LINES:
+        lines = lines[: MAX_HUMAN_LINES - 1]
+        lines.append("[session-cost: output truncated at 400 lines]")
+    return "\n".join(lines) + "\n"
+
+
+def audit(session_id: str, use_ccusage: bool, config=None) -> dict:
+    root = projects_root(config)
+    jsonl_path, folder = resolve_session(root, session_id)
+    warnings: list[str] = []
+    agents, stats = scan_session(jsonl_path, folder, warnings)
+    link_tree(agents, warnings)
+    empirical: dict = {}
+    settle_calls(agents, warnings, empirical)
+    apply_pins(agents, cfg(config, "home"))
+    need_pricing = any(agent["advisor"].total() > 0 for agent in agents.values())
+    ccusage_info = None
+    if not use_ccusage:
+        warn(warnings, "ccusage unavailable (skipped with --no-ccusage); scanner-only results")
+    else:
+        ccusage_info = run_ccusage(session_id, warnings, config)
+    table = None
+    pricing_path = None
+    entry_costs_incomplete = False
+    if ccusage_info is not None:
+        entries = ccusage_info.get("entries") if isinstance(ccusage_info.get("entries"), list) else []
+        # Placeholder; join_ccusage decides. Load pricing whenever advisor tokens
+        # exist or we might need to split a non-zero totalCost. Cheap to check
+        # after a first peek at costUSD.
+        cost_sum = 0.0
+        total = ccusage_info.get("totalCost")
+        for entry in entries:
+            if isinstance(entry, dict) and isinstance(entry.get("costUSD"), (int, float)):
+                cost_sum += float(entry["costUSD"])
+        if isinstance(total, (int, float)) and abs(cost_sum - float(total)) > max(COST_TOLERANCE, abs(float(total)) * 1e-6):
+            entry_costs_incomplete = True
+    if need_pricing or entry_costs_incomplete:
+        table, pricing_path = load_pricing(warnings, config)
+    if ccusage_info is not None:
+        summary = join_ccusage(agents, ccusage_info, table, warnings)
+    else:
+        summary = None
+    apply_advisor_costs(agents, table, pricing_path, warnings)
+    report = build_report(session_id, agents, stats, warnings, empirical, summary, pricing_path)
+    human_lines = []
+    for agent in ordered_agents(agents):
+        human_lines.extend(render_agent(agent, summary))
+    report["human_agents"] = human_lines
+    # Coverage warning count includes warnings added in build_report.
+    report["coverage"]["warnings"] = len(report["warnings"])
+    return report
+
+
+def main(argv: list[str], config=None) -> int:
+    # config is how tests inject the projects root, ccusage binary, pricing file,
+    # timeout, and definition home. The production entry point passes none of
+    # these and does not consult the environment.
+    session_id, as_json, skip_ccusage = parse_args(argv)
+    report = audit(session_id, use_ccusage=not skip_ccusage, config=config)
+    if as_json:
+        body = dict(report)
+        body.pop("human_agents", None)
+        empirical = dict(body["empirical"])
+        empirical.pop("text", None)
+        body["empirical"] = empirical
+        print(json.dumps(body, ensure_ascii=False, indent=2))
+        return 0
+    sys.stdout.write(render_human(report))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -112,6 +112,7 @@ class Suite:
             "CLAUDE_ROUTING",
             "CLAUDE_ROUTING_MODE",
             "CLAUDE_ROUTING_OTHER",
+            "CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT",
             "CLAUDE_ROUTING_SCOPE",
             "CURSOR_RUN_PATH",
             "CURSOR_AGENT",
@@ -581,6 +582,32 @@ def routing_reads_cases(suite, home, other, tree, log_root, read_main, bash_read
         "silent",
         CURSOR_RUN_PATH=str(cursor_run),
     )
+    opus_deny = (
+        'effective model opus (per-call); pass model: "sonnet" (or "haiku"), '
+        "or use a pinned agent, or set CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT=1."
+    )
+    agent_log = log_root / "agent-reads-off.jsonl"
+    expect_aw(
+        "all-writes reads off Agent opus -> deny",
+        payload("Agent", {"model": "opus", "description": "batch", "prompt": "go"}),
+        "deny",
+        opus_deny,
+        ROUTING_LOG=str(agent_log),
+    )
+    agent_records = log_records(agent_log)
+    suite.check(
+        "8",
+        "all-writes reads off Agent opus is logged",
+        len(agent_records) == 1
+        and agent_records[0].get("tool") == "Agent"
+        and agent_records[0].get("decision") == "deny"
+        and agent_records[0].get("role") == "orchestrator"
+        and agent_records[0].get("subagent_type") == "general-purpose"
+        and agent_records[0].get("model") == "opus"
+        and agent_records[0].get("description") == "batch"
+        and agent_records[0].get("mode") == "strict",
+        f"records={agent_records!r}",
+    )
     expect_aw(
         "all-writes reads off cursor-agent -> silent",
         orchestrator("Bash", bash("cursor-agent -p hi")),
@@ -984,6 +1011,26 @@ def main():
             reader("Bash", bash("echo hi")),
             "deny",
             READER_BASH_DENY,
+        )
+        suite.expect(
+            "6",
+            "Explore Bash outside a pilot still decided -> deny",
+            payload("Bash", bash("echo hi"), agent_id="ex-1", agent_type="Explore"),
+            "deny",
+            READER_BASH_DENY,
+        )
+        opus_deny = (
+            'effective model opus (per-call); pass model: "sonnet" (or "haiku"), '
+            "or use a pinned agent, or set CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT=1."
+        )
+        opus_log = log_root / "pilot-agent.jsonl"
+        suite.expect(
+            "6",
+            "pilots scope Agent opus outside a pilot -> deny",
+            payload("Agent", {"model": "opus", "description": "batch", "prompt": "go"}),
+            "deny",
+            opus_deny,
+            env_extra={"ROUTING_LOG": str(opus_log)},
         )
         suite.expect(
             "6",

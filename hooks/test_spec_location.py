@@ -551,7 +551,7 @@ def test_t7(suite: Suite):
         route_orch = _hook(ROUTE, role(), proj, tmp_root)
         reader = _hook(ROUTE, role("reader-1", "file-reader"), proj, tmp_root)
         writer = _hook(ROUTE, role("writer-1", "file-writer"), proj, tmp_root)
-        other = _hook(ROUTE, role("other-1", "Explore"), proj, tmp_root)
+        other = _hook(ROUTE, role("other-1", "worker"), proj, tmp_root)
         Path(spec).write_text("# task\n", encoding="utf-8")
         require_present = _hook(REQUIRE, role(), proj, tmp_root)
         route_present = _hook(ROUTE, role(), proj, tmp_root)

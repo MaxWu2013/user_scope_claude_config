@@ -49,7 +49,7 @@ def read_deny(subject):
     )
 
 
-def payload(tool, tool_input, *, agent_id=None, agent_type=None):
+def payload(tool, tool_input, *, agent_id=None, agent_type=None, session_id=None, cwd=None):
     body = {
         "hook_event_name": "PreToolUse",
         "tool_name": tool,
@@ -59,6 +59,10 @@ def payload(tool, tool_input, *, agent_id=None, agent_type=None):
         body["agent_id"] = agent_id
     if agent_type is not None:
         body["agent_type"] = agent_type
+    if session_id is not None:
+        body["session_id"] = session_id
+    if cwd is not None:
+        body["cwd"] = cwd
     return body
 
 
@@ -70,7 +74,7 @@ def writer(tool, tool_input):
     return payload(tool, tool_input, agent_id="writer-1", agent_type="file-writer")
 
 
-def other(tool, tool_input, agent_type="Explore"):
+def other(tool, tool_input, agent_type="worker"):
     return payload(tool, tool_input, agent_id="other-1", agent_type=agent_type)
 
 
@@ -111,6 +115,8 @@ class Suite:
             "CLAUDE_ROUTING",
             "CLAUDE_ROUTING_MODE",
             "CLAUDE_ROUTING_OTHER",
+            "CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT",
+            "CLAUDE_CODE_SUBAGENT_MODEL",
             "CURSOR_RUN_PATH",
             "CURSOR_AGENT",
             "SUB_AGENTS_DIR",
@@ -245,6 +251,8 @@ def main():
         case_22(suite, extra_dirs)
         case_23(suite, extra_dirs)
         case_24(suite)
+        case_25(suite, extra_dirs)
+        case_26(suite)
         default_records = log_records(log_path)
         allow_logs = [rec for rec in default_records if rec.get("decision") == "allow-log"]
         suite.check(
@@ -662,7 +670,7 @@ def case_14(suite, extra_dirs):
         completed.returncode == 0
         and len(records) == 1
         and records[0].get("role") == "other"
-        and records[0].get("agent_type") == "Explore"
+        and records[0].get("agent_type") == "worker"
         and records[0].get("tool") == "Write"
         and records[0].get("decision") == "allow-log"
         and records[0].get("path") == str(p / "notes.md")
@@ -701,7 +709,7 @@ def case_14(suite, extra_dirs):
         len(strict_records) == 1
         and strict_records[0].get("decision") == "deny"
         and strict_records[0].get("role") == "other"
-        and strict_records[0].get("agent_type") == "Explore"
+        and strict_records[0].get("agent_type") == "worker"
         and strict_records[0].get("tool") == "Write"
         and strict_records[0].get("path") == str(p / "notes.md")
         and strict_records[0].get("reason") == OTHER_DOC_DENY[:120]
@@ -986,7 +994,7 @@ def run_other_bash(suite, extra_dirs, label, command, kind, reason=None, *, mode
         ok = (
             len(records) == 1
             and records[0].get("role") == "other"
-            and records[0].get("agent_type") == "Explore"
+            and records[0].get("agent_type") == "worker"
             and records[0].get("tool") == "Bash"
             and records[0].get("path") == path
             and records[0].get("decision") == "allow-log"
@@ -1003,7 +1011,7 @@ def run_other_bash(suite, extra_dirs, label, command, kind, reason=None, *, mode
         label + " (one deny log)",
         log_path,
         role="other",
-        agent_type="Explore",
+        agent_type="worker",
         tool="Bash",
         path=path,
         decision="deny",
@@ -1196,7 +1204,7 @@ def case_22(suite, extra_dirs):
             "deny",
             OTHER_DOC_DENY,
             "other",
-            "Explore",
+            "worker",
             "Write",
             notes,
             None,
@@ -1433,6 +1441,807 @@ def case_24(suite):
             "deny",
             bash_read,
         )
+
+
+EXPLORE_AGENT_DENY = "Explore is off in strict mode; use file-reader."
+
+
+def effective_deny(effective, source):
+    return (
+        'effective model %s (%s); pass model: "sonnet" (or "haiku"), '
+        "or use a pinned agent, or set CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT=1."
+        % (effective, source)
+    )
+READ_LINE_EXTRA = " Read a smaller range with offset and limit, or use file-reader for large files."
+
+
+def check_spawn(
+    suite, name, log_path, *, role, subagent_type, model, description, mode, decision,
+    effective_model, effective_source, reason=None, agent_type="",
+):
+    records = log_records(log_path)
+    if len(records) != 1:
+        suite.check("25", name, False, f"records={records!r}")
+        return
+    rec = records[0]
+    allowed = set(ALLOW_LOG_FIELDS) | {
+        "subagent_type", "model", "description", "effective_model", "effective_source",
+    }
+    if decision in ("deny", "ask"):
+        allowed.add("reason")
+    problems = []
+    if set(rec) != allowed:
+        problems.append(f"keys={sorted(rec)}")
+    if rec.get("role") != role or rec.get("agent_type") != agent_type or rec.get("tool") != "Agent":
+        problems.append(
+            f"role={rec.get('role')!r} agent_type={rec.get('agent_type')!r} tool={rec.get('tool')!r}"
+        )
+    if rec.get("subagent_type") != subagent_type:
+        problems.append(f"subagent_type={rec.get('subagent_type')!r}")
+    if rec.get("model") != model:
+        problems.append(f"model={rec.get('model')!r}")
+    if rec.get("description") != description:
+        problems.append(f"description={rec.get('description')!r}")
+    if rec.get("effective_model") != effective_model:
+        problems.append(f"effective_model={rec.get('effective_model')!r}")
+    if rec.get("effective_source") != effective_source:
+        problems.append(f"effective_source={rec.get('effective_source')!r}")
+    if rec.get("decision") != decision:
+        problems.append(f"decision={rec.get('decision')!r}")
+    if not context_ok(rec, suite.project, mode):
+        problems.append(
+            f"context session_id={rec.get('session_id')!r} project={rec.get('project')!r} mode={rec.get('mode')!r}"
+        )
+    if decision in ("deny", "ask") and rec.get("reason") != (reason or "")[:120]:
+        problems.append(f"reason={rec.get('reason')!r}")
+    suite.check("25", name, not problems, "; ".join(problems) + f" record={rec!r}")
+
+
+def make_temp(extra_dirs, prefix):
+    path = Path(os.path.realpath(tempfile.mkdtemp(prefix=prefix)))
+    extra_dirs.append(path)
+    return path
+
+
+def write_agent_md(root, agent_type, model):
+    path = Path(root) / ".claude" / "agents" / f"{agent_type}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if model is None:
+        text = f"---\nname: {agent_type}\ndescription: test\n---\nbody\n"
+    else:
+        text = f"---\nname: {agent_type}\nmodel: {model}\n---\nbody\n"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def run_spawn(
+    suite, extra_dirs, name, body, *, mode, decision, effective_model, effective_source,
+    subagent_type, model, description, reason=None, env=None,
+):
+    merged = {"CLAUDE_ROUTING_MODE": mode}
+    if env:
+        merged.update(env)
+    log_path, env_extra = _fresh_env(extra_dirs, merged)
+    kind = "deny" if decision == "deny" else "silent"
+    suite.expect(
+        "25",
+        name,
+        body,
+        kind,
+        reason if decision == "deny" else None,
+        env_extra=env_extra,
+    )
+    check_spawn(
+        suite,
+        name + " logged",
+        log_path,
+        role="orchestrator",
+        subagent_type=subagent_type,
+        model=model,
+        description=description,
+        mode=mode,
+        decision="deny" if decision == "deny" else "allow-log",
+        effective_model=effective_model,
+        effective_source=effective_source,
+        reason=reason,
+    )
+
+
+def _spawn_both(suite, extra_dirs, label, body, *, strict, effective_model, effective_source,
+                subagent_type, model, description, env):
+    for mode in ("strict", "task-aware"):
+        decision = strict if mode == "strict" else "allow"
+        reason = None
+        if decision == "deny":
+            reason = effective_deny(effective_model, effective_source)
+        run_spawn(
+            suite,
+            extra_dirs,
+            f"{mode} {label}",
+            body,
+            mode=mode,
+            decision=decision,
+            effective_model=effective_model,
+            effective_source=effective_source,
+            subagent_type=subagent_type,
+            model=model,
+            description=description,
+            reason=reason,
+            env=env,
+        )
+
+
+def _effective_model_cases(suite, extra_dirs, empty_home):
+    """Strict effective-model matrix, repeated in task-aware (allow + log)."""
+    home = str(empty_home)
+    base = {"HOME": home}
+    sonnet_env = {"HOME": home, "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"}
+    _spawn_both(
+        suite, extra_dirs, "general-purpose inherit",
+        payload("Agent", {"subagent_type": "general-purpose", "model": "inherit", "description": "deep", "prompt": "x"}),
+        strict="deny", effective_model="inherit-main", effective_source="per-call",
+        subagent_type="general-purpose", model="inherit", description="deep", env=base,
+    )
+    _spawn_both(
+        suite, extra_dirs, "Plan no model",
+        payload("Agent", {"subagent_type": "Plan", "description": "plan", "prompt": "x"}),
+        strict="deny", effective_model="inherit-main", effective_source="builtin-inherit",
+        subagent_type="Plan", model="default", description="plan", env=base,
+    )
+    _spawn_both(
+        suite, extra_dirs, "claude no model",
+        payload("Agent", {"subagent_type": "claude", "description": "built-in", "prompt": "x"}),
+        strict="deny", effective_model="inherit-main", effective_source="builtin-inherit",
+        subagent_type="claude", model="default", description="built-in", env=base,
+    )
+    _spawn_both(
+        suite, extra_dirs, "Plan model sonnet",
+        payload("Agent", {"subagent_type": "Plan", "model": "sonnet", "description": "plan", "prompt": "x"}),
+        strict="allow", effective_model="sonnet", effective_source="per-call",
+        subagent_type="Plan", model="sonnet", description="plan", env=base,
+    )
+    _spawn_both(
+        suite, extra_dirs, "general-purpose no model env sonnet",
+        payload("Agent", {"description": "env", "prompt": "x"}),
+        strict="allow", effective_model="sonnet", effective_source="env-default",
+        subagent_type="general-purpose", model="default", description="env", env=sonnet_env,
+    )
+    _spawn_both(
+        suite, extra_dirs, "slack-sync opus",
+        payload("Agent", {"subagent_type": "slack-sync", "model": "opus", "description": "sync", "prompt": "x"}),
+        strict="deny", effective_model="opus", effective_source="per-call",
+        subagent_type="slack-sync", model="opus", description="sync", env=base,
+    )
+    _spawn_both(
+        suite, extra_dirs, "file-writer opus",
+        payload("Agent", {"subagent_type": "file-writer", "model": "opus", "description": "write", "prompt": "x"}),
+        strict="allow", effective_model="opus", effective_source="per-call",
+        subagent_type="file-writer", model="opus", description="write", env=base,
+    )
+    _spawn_both(
+        suite, extra_dirs, "unknown model string",
+        payload("Agent", {"subagent_type": "general-purpose", "model": "not-a-family", "description": "odd", "prompt": "x"}),
+        strict="deny", effective_model="unknown", effective_source="per-call",
+        subagent_type="general-purpose", model="not-a-family", description="odd", env=base,
+    )
+    allow_plan = {"HOME": home, "CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT": "1"}
+    _spawn_both(
+        suite, extra_dirs, "override env allows Plan",
+        payload("Agent", {"subagent_type": "Plan", "description": "plan", "prompt": "x"}),
+        strict="allow", effective_model="inherit-main", effective_source="builtin-inherit",
+        subagent_type="Plan", model="default", description="plan", env=allow_plan,
+    )
+
+    reader_home = make_temp(extra_dirs, "phase5b-reader-home-")
+    write_agent_md(reader_home, "file-reader", "haiku")
+    _spawn_both(
+        suite, extra_dirs, "user def file-reader haiku",
+        payload("Agent", {"subagent_type": "file-reader", "description": "read", "prompt": "x"}),
+        strict="allow", effective_model="haiku", effective_source="user-def",
+        subagent_type="file-reader", model="default", description="read",
+        env={"HOME": str(reader_home)},
+    )
+
+    inherit_home = make_temp(extra_dirs, "phase5b-inherit-home-")
+    write_agent_md(inherit_home, "inherit-agent", "inherit")
+    _spawn_both(
+        suite, extra_dirs, "def model inherit beats env sonnet",
+        payload("Agent", {"subagent_type": "inherit-agent", "description": "inh", "prompt": "x"}),
+        strict="deny", effective_model="inherit-main", effective_source="user-def",
+        subagent_type="inherit-agent", model="default", description="inh",
+        env={"HOME": str(inherit_home), "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"},
+    )
+
+    bare_home = make_temp(extra_dirs, "phase5b-bare-home-")
+    write_agent_md(bare_home, "bare-agent", None)
+    _spawn_both(
+        suite, extra_dirs, "def missing model env sonnet",
+        payload("Agent", {"subagent_type": "bare-agent", "description": "bare", "prompt": "x"}),
+        strict="allow", effective_model="sonnet", effective_source="env-default",
+        subagent_type="bare-agent", model="default", description="bare",
+        env={"HOME": str(bare_home), "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"},
+    )
+
+    broken_home = make_temp(extra_dirs, "phase5b-broken-home-")
+    broken = write_agent_md(broken_home, "broken-agent", "haiku")
+    os.chmod(broken, 0)
+    try:
+        _spawn_both(
+            suite, extra_dirs, "unreadable def",
+            payload("Agent", {"subagent_type": "broken-agent", "description": "bad", "prompt": "x"}),
+            strict="deny", effective_model="unknown", effective_source="unknown",
+            subagent_type="broken-agent", model="default", description="bad",
+            env={"HOME": str(broken_home)},
+        )
+    finally:
+        os.chmod(broken, 0o644)
+
+    override_home = make_temp(extra_dirs, "phase5b-override-home-")
+    write_agent_md(override_home, "file-reader", "opus")
+    project_reader = write_agent_md(suite.project, "file-reader", "haiku")
+    try:
+        _spawn_both(
+            suite, extra_dirs, "project def overrides user def",
+            payload("Agent", {"subagent_type": "file-reader", "description": "read", "prompt": "x"}),
+            strict="allow", effective_model="haiku", effective_source="project-def",
+            subagent_type="file-reader", model="default", description="read",
+            env={"HOME": str(override_home)},
+        )
+    finally:
+        project_reader.unlink()
+
+    cwd_home = make_temp(extra_dirs, "phase5b-cwd-home-")
+    cwd_project = make_temp(extra_dirs, "phase5b-cwd-project-")
+    write_agent_md(cwd_home, "cwd-agent", "sonnet")
+    project_cwd = write_agent_md(suite.project, "cwd-agent", "opus")
+    write_agent_md(cwd_project, "cwd-agent", "haiku")
+    try:
+        _spawn_both(
+            suite, extra_dirs, "payload cwd project def wins",
+            payload(
+                "Agent",
+                {"subagent_type": "cwd-agent", "description": "cwd", "prompt": "x"},
+                cwd=str(cwd_project),
+            ),
+            strict="allow", effective_model="haiku", effective_source="project-def",
+            subagent_type="cwd-agent", model="default", description="cwd",
+            env={"HOME": str(cwd_home)},
+        )
+    finally:
+        project_cwd.unlink()
+
+
+def case_25(suite, extra_dirs):
+    """Explore role, Agent spawn policy, general-purpose read budget, slack-sync writes."""
+    p = suite.project
+    code = str(p / "src" / "a.py")
+    notes = str(p / "notes.md")
+
+    suite.expect(
+        "25",
+        "Explore Read src/a.py -> silent (file-reader)",
+        payload("Read", read_input(code), agent_id="ex-1", agent_type="Explore"),
+        "silent",
+    )
+    explore_log, explore_env = _fresh_env(extra_dirs)
+    suite.expect(
+        "25",
+        "Explore Write notes.md -> deny",
+        payload("Write", write_input(notes), agent_id="ex-1", agent_type="Explore"),
+        "deny",
+        READER_WRITE_DENY,
+        env_extra=explore_env,
+    )
+    check_audit(
+        suite,
+        "25",
+        "Explore Write logged as file-reader",
+        explore_log,
+        role="file-reader",
+        agent_type="Explore",
+        tool="Write",
+        path=os.path.normpath(notes),
+        decision="deny",
+        reason=READER_WRITE_DENY,
+    )
+    suite.expect(
+        "25",
+        "Explore Bash echo -> deny",
+        payload("Bash", bash("echo hi"), agent_id="ex-1", agent_type="Explore"),
+        "deny",
+        READER_BASH_DENY,
+    )
+
+    empty_home = make_temp(extra_dirs, "phase5b-agent-home-")
+    aware_log, aware_env = _fresh_env(
+        extra_dirs, {"CLAUDE_ROUTING_MODE": "task-aware", "HOME": str(empty_home)},
+    )
+    suite.expect(
+        "25",
+        "task-aware Agent with no model -> silent",
+        payload("Agent", {"description": "scan channels", "prompt": "look"}),
+        "silent",
+        env_extra=aware_env,
+    )
+    check_spawn(
+        suite,
+        "task-aware Agent logged",
+        aware_log,
+        role="orchestrator",
+        subagent_type="general-purpose",
+        model="default",
+        description="scan channels",
+        mode="task-aware",
+        decision="allow-log",
+        effective_model="inherit-main",
+        effective_source="builtin-inherit",
+    )
+    aware_opus_log, aware_opus_env = _fresh_env(
+        extra_dirs, {"CLAUDE_ROUTING_MODE": "task-aware"},
+    )
+    suite.expect(
+        "25",
+        "task-aware Agent opus -> silent",
+        payload("Agent", {"subagent_type": "Explore", "model": "opus", "description": "deep", "prompt": "x"}),
+        "silent",
+        env_extra=aware_opus_env,
+    )
+    check_spawn(
+        suite,
+        "task-aware opus Agent logged allow",
+        aware_opus_log,
+        role="orchestrator",
+        subagent_type="Explore",
+        model="opus",
+        description="deep",
+        mode="task-aware",
+        decision="allow-log",
+        effective_model="opus",
+        effective_source="per-call",
+    )
+
+    explore_spawn_log, explore_spawn_env = _fresh_env(extra_dirs)
+    suite.expect(
+        "25",
+        "strict Agent Explore -> deny",
+        payload("Agent", {"subagent_type": "Explore", "model": "haiku", "description": "look", "prompt": "x"}),
+        "deny",
+        EXPLORE_AGENT_DENY,
+        env_extra=explore_spawn_env,
+    )
+    check_spawn(
+        suite,
+        "strict Explore Agent logged deny",
+        explore_spawn_log,
+        role="orchestrator",
+        subagent_type="Explore",
+        model="haiku",
+        description="look",
+        mode="strict",
+        decision="deny",
+        reason=EXPLORE_AGENT_DENY,
+        effective_model="haiku",
+        effective_source="per-call",
+    )
+
+    opus_log, opus_env = _fresh_env(extra_dirs)
+    suite.expect(
+        "25",
+        "strict Agent opus general-purpose -> deny",
+        payload("Agent", {
+            "subagent_type": "general-purpose",
+            "model": "claude-opus-4-6",
+            "description": "deep",
+            "prompt": "x",
+        }),
+        "deny",
+        effective_deny("opus", "per-call"),
+        env_extra=opus_env,
+    )
+    check_spawn(
+        suite,
+        "strict opus Agent logged deny",
+        opus_log,
+        role="orchestrator",
+        subagent_type="general-purpose",
+        model="claude-opus-4-6",
+        description="deep",
+        mode="strict",
+        decision="deny",
+        reason=effective_deny("opus", "per-call"),
+        effective_model="opus",
+        effective_source="per-call",
+    )
+    omitted_log, omitted_env = _fresh_env(extra_dirs)
+    suite.expect(
+        "25",
+        "strict Agent opus with no subagent_type -> deny",
+        payload("Agent", {"model": "opus", "description": "deep", "prompt": "x"}),
+        "deny",
+        effective_deny("opus", "per-call"),
+        env_extra=omitted_env,
+    )
+    check_spawn(
+        suite,
+        "omitted type logged as general-purpose",
+        omitted_log,
+        role="orchestrator",
+        subagent_type="general-purpose",
+        model="opus",
+        description="deep",
+        mode="strict",
+        decision="deny",
+        reason=effective_deny("opus", "per-call"),
+        effective_model="opus",
+        effective_source="per-call",
+    )
+
+    allow_log, allow_env = _fresh_env(extra_dirs, {"CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT": "1"})
+    suite.expect(
+        "25",
+        "strict Agent opus allowed by env -> silent",
+        payload("Agent", {"model": "opus", "description": "deep", "prompt": "x"}),
+        "silent",
+        env_extra=allow_env,
+    )
+    check_spawn(
+        suite,
+        "allowed opus Agent logged",
+        allow_log,
+        role="orchestrator",
+        subagent_type="general-purpose",
+        model="opus",
+        description="deep",
+        mode="strict",
+        decision="allow-log",
+        effective_model="opus",
+        effective_source="per-call",
+    )
+
+    plain_log, plain_env = _fresh_env(extra_dirs, {"HOME": str(empty_home)})
+    suite.expect(
+        "25",
+        "strict Agent model absent env unset -> deny",
+        payload("Agent", {"description": "batch", "prompt": "x"}),
+        "deny",
+        effective_deny("inherit-main", "builtin-inherit"),
+        env_extra=plain_env,
+    )
+    check_spawn(
+        suite,
+        "model absent env unset logged deny",
+        plain_log,
+        role="orchestrator",
+        subagent_type="general-purpose",
+        model="default",
+        description="batch",
+        mode="strict",
+        decision="deny",
+        reason=effective_deny("inherit-main", "builtin-inherit"),
+        effective_model="inherit-main",
+        effective_source="builtin-inherit",
+    )
+
+    haiku_log, haiku_env = _fresh_env(extra_dirs)
+    suite.expect(
+        "25",
+        "strict Agent file-reader haiku -> silent",
+        payload("Agent", {"subagent_type": "file-reader", "model": "haiku", "description": "read", "prompt": "x"}),
+        "silent",
+        env_extra=haiku_env,
+    )
+    check_spawn(
+        suite,
+        "file-reader haiku spawn logged allow",
+        haiku_log,
+        role="orchestrator",
+        subagent_type="file-reader",
+        model="haiku",
+        description="read",
+        mode="strict",
+        decision="allow-log",
+        effective_model="haiku",
+        effective_source="per-call",
+    )
+    _effective_model_cases(suite, extra_dirs, empty_home)
+    suite.expect(
+        "25",
+        "file-reader Read still silent",
+        reader("Read", read_input(code)),
+        "silent",
+    )
+
+    home = Path(os.path.realpath(tempfile.mkdtemp(prefix="phase5b-gp-home-")))
+    extra_dirs.append(home)
+    docs = p / "docs"
+    docs.mkdir(exist_ok=True)
+    budget_env = {"HOME": str(home), "CLAUDE_ROUTING_MODE": "task-aware"}
+    session = "gp-files"
+    first_log = None
+    for index in range(10):
+        path = docs / f"gp-{index}.md"
+        path.write_text("line\n", encoding="utf-8")
+        log_path, env = _fresh_env(extra_dirs, budget_env)
+        if first_log is None:
+            first_log = log_path
+        suite.expect(
+            "25",
+            f"general-purpose Read file {index} under budget -> silent",
+            payload(
+                "Read",
+                {"file_path": str(path), "limit": 5},
+                agent_id="gp-a",
+                agent_type="general-purpose",
+                session_id=session,
+            ),
+            "silent",
+            env_extra=env,
+        )
+    first_records = log_records(first_log)
+    suite.check(
+        "25",
+        "general-purpose under-budget Read is logged",
+        len(first_records) == 1
+        and first_records[0].get("decision") == "allow-budget"
+        and first_records[0].get("role") == "other"
+        and first_records[0].get("agent_type") == "general-purpose"
+        and first_records[0].get("tool") == "Read"
+        and first_records[0].get("budget_files") == 1
+        and first_records[0].get("lines") == 1
+        and first_records[0].get("mode") == "task-aware",
+        f"records={first_records!r}",
+    )
+    over = docs / "gp-over.md"
+    over.write_text("line\n", encoding="utf-8")
+    suite.expect(
+        "25",
+        "general-purpose 11th file -> deny",
+        payload(
+            "Read",
+            {"file_path": str(over), "limit": 5},
+            agent_id="gp-a",
+            agent_type="general-purpose",
+            session_id=session,
+        ),
+        "deny",
+        read_deny("Read from general-purpose"),
+        env_extra=budget_env,
+    )
+    other_agent = docs / "gp-b.md"
+    other_agent.write_text("line\n", encoding="utf-8")
+    other_log, other_env = _fresh_env(extra_dirs, budget_env)
+    suite.expect(
+        "25",
+        "second general-purpose agent still under its own budget -> silent",
+        payload(
+            "Read",
+            {"file_path": str(other_agent), "limit": 5},
+            agent_id="gp-b",
+            agent_type="general-purpose",
+            session_id=session,
+        ),
+        "silent",
+        env_extra=other_env,
+    )
+    other_records = log_records(other_log)
+    suite.check(
+        "25",
+        "per-agent budget starts at 1 file",
+        len(other_records) == 1
+        and other_records[0].get("decision") == "allow-budget"
+        and other_records[0].get("budget_files") == 1,
+        f"records={other_records!r}",
+    )
+    orch_path = docs / "orch-free.md"
+    orch_path.write_text("line\n", encoding="utf-8")
+    orch_log, orch_env = _fresh_env(extra_dirs, budget_env)
+    suite.expect(
+        "25",
+        "orchestrator budget is separate from general-purpose -> silent",
+        payload(
+            "Read",
+            {"file_path": str(orch_path), "limit": 5},
+            session_id=session,
+        ),
+        "silent",
+        env_extra=orch_env,
+    )
+    orch_records = log_records(orch_log)
+    suite.check(
+        "25",
+        "orchestrator counter stays separate",
+        len(orch_records) == 1
+        and orch_records[0].get("role") == "orchestrator"
+        and orch_records[0].get("decision") == "allow-budget"
+        and orch_records[0].get("budget_files") == 1,
+        f"records={orch_records!r}",
+    )
+
+    wide = docs / "gp-wide.md"
+    wide.write_text("".join(f"{i}\n" for i in range(1500)), encoding="utf-8")
+    more = docs / "gp-more.md"
+    more.write_text("".join(f"{i}\n" for i in range(600)), encoding="utf-8")
+    line_env_base = dict(budget_env)
+    wide_log, wide_env = _fresh_env(extra_dirs, line_env_base)
+    suite.expect(
+        "25",
+        "general-purpose 1500 lines under line budget -> silent",
+        payload(
+            "Read",
+            {"file_path": str(wide), "limit": 1500},
+            agent_id="gp-line",
+            agent_type="general-purpose",
+            session_id="gp-lines",
+        ),
+        "silent",
+        env_extra=wide_env,
+    )
+    wide_records = log_records(wide_log)
+    suite.check(
+        "25",
+        "line budget charges 1500",
+        len(wide_records) == 1 and wide_records[0].get("budget_lines") == 1500,
+        f"records={wide_records!r}",
+    )
+    suite.expect(
+        "25",
+        "general-purpose over line budget -> deny",
+        payload(
+            "Read",
+            {"file_path": str(more), "limit": 600},
+            agent_id="gp-line",
+            agent_type="general-purpose",
+            session_id="gp-lines",
+        ),
+        "deny",
+        read_deny("Read from general-purpose") + READ_LINE_EXTRA,
+        env_extra=line_env_base,
+    )
+
+    suite.expect(
+        "25",
+        "strict general-purpose Read -> deny",
+        payload("Read", read_input(str(docs / "gp-0.md")), agent_id="gp-a", agent_type="general-purpose"),
+        "deny",
+        read_deny("Read from general-purpose"),
+    )
+    suite.expect(
+        "25",
+        "strict general-purpose Grep -> deny",
+        payload("Grep", {"pattern": "x", "path": str(docs)}, agent_id="gp-a", agent_type="general-purpose"),
+        "deny",
+        read_deny("Grep from general-purpose"),
+    )
+    suite.expect(
+        "25",
+        "strict general-purpose Glob -> deny",
+        payload("Glob", {"pattern": "*.md", "path": str(docs)}, agent_id="gp-a", agent_type="general-purpose"),
+        "deny",
+        read_deny("Glob from general-purpose"),
+    )
+    suite.expect(
+        "25",
+        "task-aware general-purpose Grep -> deny",
+        payload("Grep", {"pattern": "x", "path": str(docs)}, agent_id="gp-a", agent_type="general-purpose"),
+        "deny",
+        read_deny("Grep from general-purpose"),
+        env_extra={"CLAUDE_ROUTING_MODE": "task-aware"},
+    )
+    suite.expect(
+        "25",
+        "slack-sync Read stays silent",
+        payload("Read", read_input(str(docs / "gp-0.md")), agent_id="slack-1", agent_type="slack-sync"),
+        "silent",
+    )
+
+    channel = p / "data" / "eng-room"
+    channel.mkdir(parents=True)
+    archive = channel / "消息-20261104.md"
+    source = channel / "source.json"
+    archive_log, archive_env = _fresh_env(extra_dirs)
+    suite.expect(
+        "25",
+        "slack-sync Write data archive -> silent",
+        payload("Write", write_input(str(archive)), agent_id="slack-1", agent_type="slack-sync"),
+        "silent",
+        env_extra=archive_env,
+    )
+    archive_records = log_records(archive_log)
+    suite.check(
+        "25",
+        "slack-sync archive write logged allow",
+        len(archive_records) == 1
+        and archive_records[0].get("role") == "other"
+        and archive_records[0].get("agent_type") == "slack-sync"
+        and archive_records[0].get("tool") == "Write"
+        and archive_records[0].get("decision") == "allow-log"
+        and archive_records[0].get("path") == os.path.normpath(str(archive)),
+        f"records={archive_records!r}",
+    )
+    source_log, source_env = _fresh_env(extra_dirs)
+    suite.expect(
+        "25",
+        "slack-sync Write source.json -> silent",
+        payload("Write", write_input(str(source)), agent_id="slack-1", agent_type="slack-sync"),
+        "silent",
+        env_extra=source_env,
+    )
+    suite.check(
+        "25",
+        "slack-sync source.json is not a routed write",
+        not source_log.exists(),
+        f"records={log_records(source_log)!r}",
+    )
+    suite.expect(
+        "25",
+        "slack-sync Write plans -> deny",
+        payload("Write", write_input("~/.claude/plans/p.md"), agent_id="slack-1", agent_type="slack-sync"),
+        "deny",
+        STATE_DENY,
+    )
+
+
+SESSION_COST_DENY = "session-cost must be invoked alone with plain arguments."
+SESSION_COST = "~/.claude/hooks/bin/session-cost"
+SESSION_COST_ABS = f"{HOME}/.claude/hooks/bin/session-cost"
+SESSION_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+
+def case_26(suite):
+    plain = f"{SESSION_COST} {SESSION_ID}"
+    flagged = f"{SESSION_COST_ABS} {SESSION_ID} --json --no-ccusage"
+    for body, label in (
+        (reader("Bash", bash(plain)), "reader session-cost -> silent"),
+        (reader("Bash", bash(flagged)), "reader absolute session-cost flags -> silent"),
+        (reader("Bash", bash(f"  {plain} --json")), "reader indented session-cost -> silent"),
+        (
+            payload("Bash", bash(plain), agent_id="explore-1", agent_type="Explore"),
+            "Explore session-cost -> silent",
+        ),
+        (orchestrator("Bash", bash(plain)), "orchestrator session-cost -> silent"),
+        (orchestrator("Bash", bash(flagged)), "orchestrator absolute session-cost -> silent"),
+        (orchestrator("Bash", bash("echo hello")), "orchestrator echo still silent"),
+    ):
+        suite.expect("26", label, body, "silent")
+    unsafe = (
+        (f"{plain} | cat", "pipe"),
+        (f"{plain}; ls", "semicolon"),
+        (f"{plain} > /tmp/session-cost-out", "redirect"),
+        (f"{plain} $(id)", "command substitution"),
+        (f"{plain} `id`", "backticks"),
+        (f"bash -c '{plain}'", "bash -c"),
+        (f"sh -c '{plain}'", "sh -c"),
+        (f"eval {plain}", "eval"),
+    )
+    for command, label in unsafe:
+        suite.expect(
+            "26",
+            f"reader session-cost {label} -> deny",
+            reader("Bash", bash(command)),
+            "deny",
+            READER_BASH_DENY,
+        )
+        suite.expect(
+            "26",
+            f"orchestrator session-cost {label} -> deny",
+            orchestrator("Bash", bash(command)),
+            "deny",
+            SESSION_COST_DENY,
+        )
+    suite.expect(
+        "26",
+        "reader bare session-cost -> deny",
+        reader("Bash", bash(f"session-cost {SESSION_ID}")),
+        "deny",
+        READER_BASH_DENY,
+    )
+    suite.expect(
+        "26",
+        "file-writer session-cost -> deny",
+        writer("Bash", bash(plain)),
+        "deny",
+        WRITER_BASH_DENY,
+    )
 
 
 if __name__ == "__main__":
