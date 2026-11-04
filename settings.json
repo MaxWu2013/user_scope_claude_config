@@ -1,6 +1,8 @@
 {
-  "env": {},
-  "model": "opus",
+  "env": {
+    "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet",
+    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1"
+  },
   "hooks": {
     "Notification": [
       {
@@ -104,7 +106,7 @@
         ]
       },
       {
-        "matcher": "Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit|Bash|mcp__mcp-obsidian__.*",
+        "matcher": "Read|Grep|Glob|Edit|Write|MultiEdit|NotebookEdit|Bash|mcp__mcp-obsidian__.*|Agent",
         "hooks": [
           {
             "type": "command",
@@ -204,5 +206,6 @@
       }
     }
   },
-  "theme": "dark"
+  "theme": "dark",
+  "model": "opus"
 }
