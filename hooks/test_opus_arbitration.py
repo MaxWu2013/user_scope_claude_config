@@ -97,7 +97,7 @@ class World:
         data.mkdir(parents=True)
         shutil.copy(POLICY, data / "opus-arbitration-policy.json")
         agents = self.home / ".claude" / "agents"
-        _agent_md(agents / "opus-judge.md", "opus", "tools: []\n")
+        _agent_md(agents / "opus-judge.md", "opus", "tools: Read\n")
         _agent_md(agents / "file-reader.md", "haiku")
         _agent_md(agents / "file-writer.md", "sonnet")
         self._plugins()
@@ -1932,7 +1932,7 @@ def test_v2_hardening(suite):
 
         project_judge = world.project / ".claude" / "agents" / "opus-judge.md"
         project_judge.parent.mkdir(parents=True, exist_ok=True)
-        project_judge.write_text("---\nmodel: opus\ntools: []\n---\n", encoding="utf-8")
+        project_judge.write_text("---\nmodel: opus\ntools: Read\n---\n", encoding="utf-8")
         kind, reason = verdict(run_gate(world, agent_payload(
             world, subagent_type="opus-judge", model="opus", transcript=world.opus_transcript,
             session_id="sess-shadow", tool_use_id="judge-shadow", description="Judge",
@@ -1951,24 +1951,41 @@ def test_v2_hardening(suite):
         )))
         suite.check("H4", "symlinked judge definition is invalid", kind == "deny" and reason == "JUDGE_DEFINITION_INVALID", reason)
         user_judge.unlink()
-        user_judge.write_text("---\nmodel: haiku\ntools: []\n---\n", encoding="utf-8")
+        user_judge.write_text("---\nmodel: haiku\ntools: Read\n---\n", encoding="utf-8")
         kind, reason = verdict(run_gate(world, agent_payload(
             world, subagent_type="opus-judge", model="opus", transcript=world.opus_transcript,
             session_id="sess-haiku-judge", tool_use_id="judge-haiku", description="Judge",
         )))
         suite.check("H4", "judge model other than opus is invalid", kind == "deny" and reason == "JUDGE_DEFINITION_INVALID", reason)
-        user_judge.write_text("---\nmodel: opus\ntools: [Read]\n---\n", encoding="utf-8")
-        kind, reason = verdict(run_gate(world, agent_payload(
-            world, subagent_type="opus-judge", model="opus", transcript=world.opus_transcript,
-            session_id="sess-tools", tool_use_id="judge-tools", description="Judge",
-        )))
-        suite.check("H4", "judge tools other than [] are invalid", kind == "deny" and reason == "JUDGE_DEFINITION_INVALID", reason)
+        for label, body in (
+            ("[]", "tools: []\n"),
+            ("Read, Bash", "tools: Read, Bash\n"),
+            ("star", "tools: '*'\n"),
+            ("disallowedTools", "tools: Read\ndisallowedTools: Bash\n"),
+        ):
+            user_judge.write_text("---\nmodel: opus\n%s---\n" % body, encoding="utf-8")
+            kind, reason = verdict(run_gate(world, agent_payload(
+                world, subagent_type="opus-judge", model="opus", transcript=world.opus_transcript,
+                session_id="sess-tools-" + label, tool_use_id="judge-tools-" + label, description="Judge",
+            )))
+            suite.check(
+                "H4",
+                "judge tools %s are invalid" % label,
+                kind == "deny" and reason == "JUDGE_DEFINITION_INVALID",
+                reason,
+            )
         user_judge.write_text("---\nmodel: opus\n---\n", encoding="utf-8")
         kind, reason = verdict(run_gate(world, agent_payload(
             world, subagent_type="opus-judge", model="opus", transcript=world.opus_transcript,
             session_id="sess-notools", tool_use_id="judge-notools", description="Judge",
         )))
         suite.check("H4", "judge without tools is invalid", kind == "deny" and reason == "JUDGE_DEFINITION_INVALID", reason)
+        user_judge.write_text("---\nmodel: opus\ntools: [Read]\n---\n", encoding="utf-8")
+        kind, reason = verdict(run_gate(world, agent_payload(
+            world, subagent_type="opus-judge", model="opus", transcript=world.opus_transcript,
+            session_id="sess-tools-list", tool_use_id="judge-tools-list", description="Judge",
+        )))
+        suite.check("H4", "judge tools [Read] still needs a pending request", kind == "deny" and reason == "JUDGE_NOT_PENDING", reason)
         user_judge.write_text(saved, encoding="utf-8")
         kind, reason = verdict(run_gate(world, agent_payload(
             world, subagent_type="opus-judge", model="opus", transcript=world.opus_transcript,
@@ -2244,15 +2261,26 @@ def test_hardening2(suite):
             )
         user_judge = world.home / ".claude" / "agents" / "opus-judge.md"
         saved = user_judge.read_text(encoding="utf-8")
-        user_judge.write_text("---\nmodel: opus\ntools : []\n---\n", encoding="utf-8")
+        user_judge.write_text("---\nmodel: opus\ntools : Read\n---\n", encoding="utf-8")
         kind, reason = verdict(run_gate(world, agent_payload(
             world, subagent_type="opus-judge", model="opus", transcript=world.opus_transcript,
             session_id="sess-tools-space", tool_use_id="judge-tools-space", description="Judge",
         )))
         suite.check(
             "K1",
-            "judge tools with odd spacing is an empty list",
+            "judge tools Read with odd key spacing stays valid",
             kind == "deny" and reason == "JUDGE_NOT_PENDING",
+            reason[:160],
+        )
+        user_judge.write_text("---\nmodel: opus\ntools : []\n---\n", encoding="utf-8")
+        kind, reason = verdict(run_gate(world, agent_payload(
+            world, subagent_type="opus-judge", model="opus", transcript=world.opus_transcript,
+            session_id="sess-tools-empty", tool_use_id="judge-tools-empty", description="Judge",
+        )))
+        suite.check(
+            "K1",
+            "judge tools [] are invalid",
+            kind == "deny" and reason == "JUDGE_DEFINITION_INVALID",
             reason[:160],
         )
         user_judge.write_text("---\nmodel: opus\ntools : [ ]\n---\n", encoding="utf-8")
@@ -2262,7 +2290,7 @@ def test_hardening2(suite):
         )))
         suite.check(
             "K1",
-            "judge tools that are not exactly [] are invalid",
+            "a spaced empty tools list is invalid",
             kind == "deny" and reason == "JUDGE_DEFINITION_INVALID",
             reason[:160],
         )
@@ -2526,7 +2554,7 @@ def test_strict_rules(suite):
         )
         user_judge = world.home / ".claude" / "agents" / "opus-judge.md"
         saved_judge = user_judge.read_text(encoding="utf-8")
-        user_judge.write_text("---\nmodel: opus # pinned\ntools: [] # none\n---\n", encoding="utf-8")
+        user_judge.write_text("---\nmodel: opus # pinned\ntools: Read # only\n---\n", encoding="utf-8")
         kind, reason = verdict(run_gate(world, agent_payload(
             world, subagent_type="opus-judge", model="opus", transcript=world.opus_transcript,
             session_id="sess-judge-comment", tool_use_id="judge-comment", description="Judge",
@@ -3647,7 +3675,7 @@ def _enable_planning(world):
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-def _planner_file(world, model="opus", tools="tools: []\n"):
+def _planner_file(world, model="opus", tools="tools: Read\n"):
     _agent_md(world.home / ".claude" / "agents" / "opus-planner.md", model, tools)
 
 
@@ -3887,11 +3915,32 @@ def test_planner(suite):
     broken = World()
     try:
         _enable_planning(broken)
+        for label, tools in (
+            ("[]", "tools: []\n"),
+            ("omitted", ""),
+            ("Read, Bash", "tools: Read, Bash\n"),
+            ("disallowedTools", "tools: [Read, Bash]\ndisallowedTools: [Bash]\n"),
+        ):
+            _planner_file(broken, tools=tools)
+            kind, reason = verdict(run_gate(broken, _planner_call(
+                broken, session_id="sess-tools-" + label, tool_use_id="bad-tools-" + label,
+            )))
+            suite.check(
+                "P9",
+                "planner tools %s are invalid" % label,
+                kind == "deny" and reason == "PLANNER_DEFINITION_INVALID",
+                reason,
+            )
         _planner_file(broken, tools="tools: [Read]\n")
         kind, reason = verdict(run_gate(broken, _planner_call(
-            broken, session_id="sess-tools", tool_use_id="bad-tools",
+            broken, session_id="sess-tools-list", tool_use_id="tools-list",
         )))
-        suite.check("P9", "non-empty tools are an invalid planner", kind == "deny" and reason == "PLANNER_DEFINITION_INVALID", reason)
+        suite.check(
+            "P9",
+            "planner tools [Read] pass the definition check",
+            kind == "deny" and "ARBITRATION_REQUIRED" in reason,
+            reason[:200],
+        )
         _planner_file(broken, model="haiku")
         kind, reason = verdict(run_gate(broken, _planner_call(
             broken, session_id="sess-model", tool_use_id="bad-model",
@@ -3899,14 +3948,14 @@ def test_planner(suite):
         suite.check("P9", "a non-opus planner model is invalid", kind == "deny" and reason == "PLANNER_DEFINITION_INVALID", reason)
         _planner_file(broken)
         project_agent = broken.project / ".claude" / "agents" / "opus-planner.md"
-        _agent_md(project_agent, "opus", "tools: []\n")
+        _agent_md(project_agent, "opus", "tools: Read\n")
         kind, reason = verdict(run_gate(broken, _planner_call(
             broken, session_id="sess-shadow", tool_use_id="shadow-project",
         )))
         suite.check("P9", "a project planner shadows the user file", kind == "deny" and reason == "PLANNER_SHADOWED", reason)
         project_agent.unlink()
         plugin_agent = broken.home / ".claude" / "plugins" / "opusplug" / "agents" / "opus-planner.md"
-        _agent_md(plugin_agent, "opus", "tools: []\n")
+        _agent_md(plugin_agent, "opus", "tools: Read\n")
         kind, reason = verdict(run_gate(broken, _planner_call(
             broken, session_id="sess-plugin", tool_use_id="shadow-plugin",
         )))

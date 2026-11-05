@@ -405,6 +405,101 @@ def test_guard(suite):
         world.close()
 
 
+def _role_payload(world, agent_type, tool, tool_use_id, agent_id=None):
+    payload = {
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool,
+        "agent_type": agent_type,
+        "session_id": "sess-role",
+        "cwd": str(world.project),
+        "tool_use_id": tool_use_id,
+        "tool_input": {},
+    }
+    if agent_id:
+        payload["agent_id"] = agent_id
+    return payload
+
+
+def test_role_tools(suite):
+    denied_tools = (
+        "Bash",
+        "Write",
+        "Edit",
+        "Agent",
+        "mcp__mcp-obsidian__obsidian_put_content",
+        "Workflow",
+    )
+    world = base.World()
+    try:
+        for agent_type in ("opus-judge", "opus-planner"):
+            for tool in denied_tools:
+                kind, reason = base.verdict(run_guard(
+                    world, _role_payload(world, agent_type, tool, "%s-%s" % (agent_type, tool)),
+                ))
+                suite.check(
+                    "RT",
+                    "%s %s is denied" % (agent_type, tool),
+                    kind == "deny" and reason == "OPUS_ROLE_TOOL_DENIED %s" % tool,
+                    reason[:200],
+                )
+            allowed = run_guard(world, _role_payload(world, agent_type, "Read", agent_type + "-read"))
+            suite.check(
+                "RT",
+                "%s Read is allowed" % agent_type,
+                allowed.returncode == 0 and allowed.stdout == "",
+                "code=%s stdout=%r" % (allowed.returncode, allowed.stdout[:120]),
+            )
+        inside = _role_payload(
+            world, "opus-judge", "Bash", "judge-inside", agent_id="a" + "1" * 16,
+        )
+        kind, reason = base.verdict(run_guard(world, inside))
+        suite.check(
+            "RT",
+            "a judge tool call inside a workflow is still denied",
+            kind == "deny" and reason == "OPUS_ROLE_TOOL_DENIED Bash",
+            reason[:200],
+        )
+        other = run_guard(world, _role_payload(world, "file-reader", "Bash", "other-bash"))
+        suite.check(
+            "RT",
+            "another agent type is unaffected",
+            other.returncode == 0 and other.stdout == "",
+            "code=%s stdout=%r" % (other.returncode, other.stdout[:120]),
+        )
+        policy = world.home / ".claude" / "hooks" / "data" / "opus-arbitration-policy.json"
+        saved = policy.read_text(encoding="utf-8")
+        renamed = json.loads(saved)
+        renamed["judge_agent_type"] = "custom-judge"
+        renamed["planning"]["planner_agent_type"] = "custom-planner"
+        policy.write_text(json.dumps(renamed), encoding="utf-8")
+        custom_kind, custom_reason = base.verdict(run_guard(
+            world, _role_payload(world, "custom-judge", "Write", "custom-judge-write"),
+        ))
+        old_kind, old_reason = base.verdict(run_guard(
+            world, _role_payload(world, "opus-judge", "Bash", "renamed-old-judge"),
+        ))
+        suite.check(
+            "RT",
+            "policy names replace the defaults",
+            custom_kind == "deny" and custom_reason == "OPUS_ROLE_TOOL_DENIED Write"
+            and old_kind == "allow",
+            "custom=%s %s old=%s %s" % (custom_kind, custom_reason[:80], old_kind, old_reason[:80]),
+        )
+        policy.write_text("{", encoding="utf-8")
+        for agent_type, tool in (("opus-judge", "Bash"), ("opus-planner", "Edit")):
+            kind, reason = base.verdict(run_guard(
+                world, _role_payload(world, agent_type, tool, "bad-policy-" + agent_type),
+            ))
+            suite.check(
+                "RT",
+                "a malformed policy still denies %s" % agent_type,
+                kind == "deny" and reason == "OPUS_ROLE_TOOL_DENIED %s" % tool,
+                reason[:200],
+            )
+    finally:
+        world.close()
+
+
 def test_replan_surface(suite):
     world = base.World()
     try:
@@ -456,6 +551,7 @@ def test_replan_surface(suite):
 def main():
     suite = base.Suite()
     test_guard(suite)
+    test_role_tools(suite)
     test_replan_surface(suite)
     print("Tally: %s passed, %s failed" % (suite.passed, suite.failed))
     if suite.failures:

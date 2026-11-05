@@ -2,8 +2,10 @@
 """Guard workflow workers and surface their judge candidates on the main thread.
 
 The fast path imports only json, sys, and os. It returns immediately unless the
-payload is a workflow-subagent event or a main-thread PreToolUse whose session
-has a surface flag. Worker PreToolUse failures deny. Start and Stop never block.
+payload is a workflow-subagent event, a pinned Opus role PreToolUse, or a
+main-thread PreToolUse whose session has a surface flag. Worker PreToolUse
+failures deny. Start and Stop never block. The opus-judge and opus-planner
+roles may use Read and no other tool.
 """
 
 import json
@@ -78,6 +80,72 @@ def _write_guard_attest(data):
 def _has_agent(data):
     agent_id = data.get("agent_id")
     return isinstance(agent_id, str) and agent_id.strip() != ""
+
+
+def _policy_role_names():
+    """(judge type, planner type) from policy, or the defaults when unreadable."""
+    judge = "opus-judge"
+    planner = "opus-planner"
+    path = os.path.join(
+        os.path.expanduser("~"), ".claude", "hooks", "data", "opus-arbitration-policy.json",
+    )
+    try:
+        import stat
+        info = os.lstat(path)
+    except OSError:
+        return judge, planner
+    if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+        return judge, planner
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return judge, planner
+    try:
+        try:
+            blob = os.read(fd, 65537)
+        except OSError:
+            return judge, planner
+    finally:
+        os.close(fd)
+    if len(blob) > 65536:
+        return judge, planner
+    try:
+        data = json.loads(blob.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, ValueError):
+        return judge, planner
+    if not isinstance(data, dict):
+        return judge, planner
+    raw_judge = data.get("judge_agent_type")
+    if isinstance(raw_judge, str) and raw_judge != "":
+        judge = raw_judge
+    planning = data.get("planning")
+    if isinstance(planning, dict):
+        raw_planner = planning.get("planner_agent_type")
+        if isinstance(raw_planner, str) and raw_planner != "":
+            planner = raw_planner
+    return judge, planner
+
+
+def _role_tool_result(data):
+    """0 when a pinned Opus role may use this tool, deny-code when it may not.
+
+    None means the payload is not a PreToolUse from the judge or planner.
+    Policy is read only on this branch. A missing or malformed policy uses
+    opus-judge and opus-planner.
+    """
+    if not isinstance(data, dict) or data.get("hook_event_name") != "PreToolUse":
+        return None
+    agent_type = data.get("agent_type")
+    if not isinstance(agent_type, str) or agent_type == "":
+        return None
+    judge, planner = _policy_role_names()
+    if agent_type != judge and agent_type != planner:
+        return None
+    tool = data.get("tool_name")
+    if tool == "Read":
+        return 0
+    shown = tool if isinstance(tool, str) else ""
+    return _deny("OPUS_ROLE_TOOL_DENIED %s" % shown)
 
 
 def _interesting(data):
@@ -306,6 +374,10 @@ def main():
         if "workflow-subagent" in raw:
             return 2
         return 0
+    if isinstance(data, dict):
+        role = _role_tool_result(data)
+        if role is not None:
+            return role
     if isinstance(data, dict) and _main_workflow(data):
         _write_guard_attest(data)
     if not _interesting(data):

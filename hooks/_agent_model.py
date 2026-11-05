@@ -890,12 +890,96 @@ def non_opus_baseline(payload, tool_input):
     return main
 
 
+def _bare_tool_token(raw):
+    """One tool name, or None when the token is empty or not a single name."""
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1].strip()
+    if text == "":
+        return None
+    if any(ch.isspace() or ch in ",[]{}#:" for ch in text):
+        return None
+    return text
+
+
+def _flow_tool_names(text):
+    """Set of names in a flow list, or None when the list is not plain names."""
+    if not isinstance(text, str) or not text.startswith("[") or not text.endswith("]"):
+        return None
+    inner = text[1:-1].strip()
+    if inner == "":
+        return set()
+    names = set()
+    buf = []
+    quote = None
+    for ch in inner:
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            buf.append(ch)
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            continue
+        if ch == ",":
+            token = _bare_tool_token("".join(buf))
+            if token is None:
+                return None
+            names.add(token)
+            buf = []
+            continue
+        if ch in "[]{}":
+            return None
+        buf.append(ch)
+    if quote is not None:
+        return None
+    token = _bare_tool_token("".join(buf))
+    if token is None:
+        return None
+    names.add(token)
+    return names
+
+
+def _tool_name_set(value):
+    """Tool names from a scalar or a flow list. None when the value is not that."""
+    if isinstance(value, list):
+        if value == []:
+            return set()
+        return None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if text.startswith("["):
+        return _flow_tool_names(text)
+    token = _bare_tool_token(text)
+    if token is None:
+        return None
+    return {token}
+
+
+def _tools_are_exactly_read(fields):
+    """True when tools resolves to exactly {Read} and disallowedTools is absent.
+
+    Accept the scalar Read or the flow list [Read], including quotes and
+    surrounding space. An empty list, an omitted field, *, extra tools, and
+    any disallowedTools key are rejected.
+    """
+    if not isinstance(fields, dict) or "tools" not in fields:
+        return False
+    if "disallowedtools" in fields:
+        return False
+    return _tool_name_set(fields.get("tools")) == {"Read"}
+
+
 def _strict_opus_tools_status(payload, agent_type):
-    """ok, shadowed, or invalid for a pinned opus agent with an empty tools list.
+    """ok, shadowed, or invalid for a pinned opus agent whose only tool is Read.
 
     A project file at <project>/.claude/agents/<agent_type>.md shadows the
     user file. The user file must be a regular file whose strict frontmatter
-    has model: opus and tools: [] exactly.
+    has model: opus and tools resolving to exactly {Read}.
     """
     project = _agent_project(payload if isinstance(payload, dict) else {})
     project_file = os.path.join(project, ".claude", "agents", agent_type + ".md")
@@ -911,7 +995,7 @@ def _strict_opus_tools_status(payload, agent_type):
     status, fields = _read_strict_frontmatter(user_file)
     if status != "ok" or not isinstance(fields, dict):
         return "invalid"
-    if fields.get("model") != "opus" or fields.get("tools") != []:
+    if fields.get("model") != "opus" or not _tools_are_exactly_read(fields):
         return "invalid"
     return "ok"
 
@@ -921,7 +1005,7 @@ def judge_definition_status(payload, judge_type):
 
     The exemption needs subagent type opus-judge, no project file at
     <project>/.claude/agents/opus-judge.md, and a regular user file whose
-    strict frontmatter has model: opus and tools: [] exactly.
+    strict frontmatter has model: opus and tools resolving to exactly {Read}.
     """
     if judge_type != "opus-judge":
         return "invalid"
@@ -967,8 +1051,8 @@ def _plugin_agent_named(agent_type):
 def planner_definition_status(payload, planner_type):
     """ok, PLANNER_SHADOWED, or PLANNER_DEFINITION_INVALID.
 
-    The user definition must be model opus with tools []. A project file or a
-    plugin agent of the same name shadows it.
+    The user definition must be model opus with tools resolving to exactly
+    {Read}. A project file or a plugin agent of the same name shadows it.
     """
     if not isinstance(planner_type, str) or not _AGENT_TYPE_RE.fullmatch(planner_type):
         return "PLANNER_DEFINITION_INVALID"

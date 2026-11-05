@@ -427,7 +427,7 @@ def test_import_failure(suite):
 def test_judge_file(suite):
     text = JUDGE.read_text(encoding="utf-8")
     front = text.split("---", 2)[1]
-    suite.check("U33", "opus-judge pins opus and no tools", "\nmodel: opus\n" in front and "\ntools: []\n" in front, front)
+    suite.check("U33", "opus-judge pins opus and Read", "\nmodel: opus\n" in front and "\ntools: Read\n" in front, front)
 
 
 def test_worker_writes(suite):
