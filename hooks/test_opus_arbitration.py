@@ -4965,6 +4965,235 @@ def test_wp3b(suite):
         linked.close()
 
 
+def _plant_open(session_id, task_id, state):
+    """A live request in this state. Later plants must not see it as expired."""
+    made = arb.register_candidate(
+        session_id=session_id,
+        task_id=task_id,
+        trigger="T02",
+        reason_code="UNAPPROVED_OPUS",
+        scope_digest=task_id,
+        summary="stale",
+    )
+    request_id = made["request"]["request_id"] if made.get("ok") else ""
+    if state == "JUDGE_PENDING" and request_id:
+        arb.promote_pending(request_id)
+    elif state == "REPLAN_PENDING" and request_id:
+        arb.transition_to(request_id, "REPLAN_PENDING")
+    return made.get("ok") is True, request_id
+
+
+def _expire_requests(request_ids):
+    """Move expires into the past without running the sweep."""
+    import sqlite3
+
+    db = os.environ["HOME"] + "/.claude/logs/opus-arbitration/ledger.db"
+    conn = sqlite3.connect(db)
+    for request_id in request_ids:
+        conn.execute(
+            "UPDATE requests SET expires=? WHERE request_id=?",
+            (time.time() - 30, request_id),
+        )
+    conn.commit()
+    conn.close()
+
+
+def _follow_event(world, request_id, from_state):
+    found = [
+        row for row in rows(world, "events")
+        if row.get("event") == "no_follow_through" and row.get("request_id") == request_id
+    ]
+    if not found:
+        return False
+    detail = found[-1].get("detail_json") or ""
+    return '"from_state":"%s"' % from_state in detail
+
+
+def test_read_sweep(suite):
+    world = World()
+    try:
+        shown_ok, shown_id = _plant_open("sess-show", "show-task", "JUDGE_PENDING")
+        _expire_requests([shown_id])
+        shown = subprocess.run(
+            [sys.executable, str(CLI), "show", shown_id],
+            capture_output=True, text=True, env=world.env(), timeout=15, check=False,
+        )
+        try:
+            body = json.loads(shown.stdout)
+        except json.JSONDecodeError:
+            body = {}
+        suite.check(
+            "T24",
+            "show expires one JUDGE_PENDING row past its ttl",
+            shown_ok and shown.returncode == 0
+            and body.get("state") == "EXPIRED"
+            and body.get("decision") == "NO_FOLLOW_THROUGH"
+            and _follow_event(world, shown_id, "JUDGE_PENDING"),
+            "exit=%s body=%s" % (shown.returncode, shown.stdout[:300]),
+        )
+        planted = []
+        for state, session_id, task_id in (
+            ("JUDGE_PENDING", "sess-st-judge", "st-judge"),
+            ("CANDIDATE", "sess-st-cand", "st-cand"),
+            ("REPLAN_PENDING", "sess-st-replan", "st-replan"),
+        ):
+            ok, request_id = _plant_open(session_id, task_id, state)
+            planted.append((ok, state, request_id))
+        _expire_requests([request_id for _ok, _state, request_id in planted])
+        before = {row["request_id"]: row["state"] for row in rows(world, "requests")}
+        status = subprocess.run(
+            [sys.executable, str(CLI), "status"],
+            capture_output=True, text=True, env=world.env(), timeout=15, check=False,
+        )
+        after = {row["request_id"]: row for row in rows(world, "requests")}
+        expired_ok = True
+        detail = []
+        for ok, state, request_id in planted:
+            row = after.get(request_id) or {}
+            line_ok = (
+                request_id in status.stdout
+                and "state=EXPIRED" in status.stdout
+                and "decision=NO_FOLLOW_THROUGH" in status.stdout
+            )
+            # The request's own recent line carries both fields.
+            own = any(
+                request_id in line and "state=EXPIRED" in line and "decision=NO_FOLLOW_THROUGH" in line
+                for line in status.stdout.splitlines()
+            )
+            good = (
+                ok and before.get(request_id) == state
+                and row.get("state") == "EXPIRED"
+                and row.get("decision") == "NO_FOLLOW_THROUGH"
+                and own and line_ok
+                and _follow_event(world, request_id, state)
+                and ("from_state=%s" % state) in status.stdout
+            )
+            if not good:
+                expired_ok = False
+            detail.append("%s ok=%s before=%s after=%s own=%s" % (
+                state, ok, before.get(request_id), row.get("state"), own,
+            ))
+        suite.check(
+            "T24",
+            "one status call expires JUDGE_PENDING, CANDIDATE, and REPLAN_PENDING",
+            status.returncode == 0 and expired_ok,
+            "exit=%s %s" % (status.returncode, "; ".join(detail)),
+        )
+        plan_ok, plan_id = _plant_open("sess-plan-show", "plan-show", "CANDIDATE")
+        _expire_requests([plan_id])
+        plan_show = subprocess.run(
+            [sys.executable, str(ROOT / "bin" / "router-plan"), "show", "missing-task"],
+            capture_output=True, text=True, env=world.env(), timeout=15, check=False,
+        )
+        plan_row = next((row for row in rows(world, "requests") if row["request_id"] == plan_id), {})
+        suite.check(
+            "T24",
+            "router-plan show sweeps before it reads",
+            plan_ok and plan_row.get("state") == "EXPIRED"
+            and plan_row.get("decision") == "NO_FOLLOW_THROUGH"
+            and _follow_event(world, plan_id, "CANDIDATE")
+            and "sweep skipped" not in plan_show.stdout,
+            "exit=%s state=%s" % (plan_show.returncode, plan_row.get("state")),
+        )
+    finally:
+        world.close()
+
+    locked = World()
+    holder = None
+    status_proc = None
+    try:
+        ok, request_id = _plant_open("sess-busy", "busy-task", "JUDGE_PENDING")
+        _expire_requests([request_id])
+        db = locked.home / ".claude" / "logs" / "opus-arbitration" / "ledger.db"
+        holder = subprocess.Popen(
+            [
+                sys.executable, "-c",
+                "import sqlite3,sys\n"
+                "conn=sqlite3.connect(sys.argv[1], isolation_level=None, timeout=60)\n"
+                "conn.execute('BEGIN IMMEDIATE')\n"
+                "print('locked', flush=True)\n"
+                "sys.stdin.readline()\n"
+                "conn.execute('ROLLBACK')\n",
+                str(db),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        ready = holder.stdout.readline()
+        status_proc = subprocess.Popen(
+            [sys.executable, str(CLI), "status"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=locked.env(),
+            cwd=str(locked.project),
+        )
+        chunks = []
+
+        def _read_status():
+            while True:
+                line = status_proc.stdout.readline()
+                if line == "":
+                    break
+                chunks.append(line)
+                if "sweep skipped: ledger busy" in line:
+                    try:
+                        holder.stdin.write("\n")
+                        holder.stdin.flush()
+                    except Exception:
+                        pass
+
+        import threading
+        reader = threading.Thread(target=_read_status)
+        reader.start()
+        reader.join(timeout=20)
+        if status_proc.poll() is None:
+            try:
+                holder.stdin.write("\n")
+                holder.stdin.flush()
+            except Exception:
+                pass
+            try:
+                status_proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                status_proc.kill()
+                status_proc.wait(timeout=5)
+        else:
+            status_proc.wait(timeout=5)
+        reader.join(timeout=5)
+        stdout = "".join(chunks)
+        stderr = ""
+        if status_proc.stderr is not None:
+            stderr = status_proc.stderr.read()
+        kept = next((row for row in rows(locked, "requests") if row["request_id"] == request_id), {})
+        suite.check(
+            "T24",
+            "a busy ledger prints the skip line and status exits 0",
+            ok and ready.strip() == "locked"
+            and status_proc.returncode == 0
+            and "sweep skipped: ledger busy" in stdout
+            and kept.get("state") == "JUDGE_PENDING",
+            "exit=%s state=%s stdout=%s stderr=%s" % (
+                None if status_proc is None else status_proc.returncode,
+                kept.get("state"), stdout[:300], stderr[:200],
+            ),
+        )
+    finally:
+        if holder is not None and holder.poll() is None:
+            try:
+                holder.stdin.write("\n")
+                holder.stdin.flush()
+            except Exception:
+                pass
+            holder.kill()
+            holder.wait(timeout=5)
+        if status_proc is not None and status_proc.poll() is None:
+            status_proc.kill()
+            status_proc.wait(timeout=5)
+        locked.close()
+
+
 def main():
     suite = Suite()
     test_resolution(suite)
@@ -4989,6 +5218,7 @@ def main():
     test_planner(suite)
     test_replan(suite)
     test_wp3b(suite)
+    test_read_sweep(suite)
     suite.check(
         "REF",
         "gate output never contains permissionDecision allow",

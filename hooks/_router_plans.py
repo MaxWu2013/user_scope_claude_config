@@ -749,12 +749,13 @@ def _cmd_promote(args):
 
 
 def _cmd_show(task_id):
+    import _opus_arbitration as arb
+
+    arb.sweep_for_read()
     record = load_current(task_id)
     if record is None:
         print("router-plan: no current plan")
         return _emit(False, "ROUTER_PLAN_MISSING", 1)
-    import _opus_arbitration as arb
-
     stages = arb.task_stages(task_id)
     ledger_missing = arb.active_plan_version(task_id) != record.get("version")
     if ledger_missing:

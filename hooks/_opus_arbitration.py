@@ -3384,7 +3384,24 @@ def unresolved_follow_through(now=None):
     return items
 
 
+def sweep_for_read():
+    """Expire stale rows before a CLI read.
+
+    The sweep uses the same write transaction as the gate. A busy ledger is
+    reported and the read continues. No ledger means there is nothing to sweep.
+    """
+    if not os.path.lexists(ledger_path()):
+        return
+    try:
+        with _db() as conn:
+            with _Tx(conn):
+                _sweep(conn, time.time())
+    except (GateBusy, sqlite3.OperationalError):
+        print("sweep skipped: ledger busy", flush=True)
+
+
 def cmd_status():
+    sweep_for_read()
     print("switch: %s" % read_switch())
     policy = load_policy()
     if policy is None or not policy.get("enabled"):
@@ -3460,6 +3477,7 @@ def cmd_status():
 
 
 def cmd_show(request_id):
+    sweep_for_read()
     data = show_request(request_id)
     if data is None:
         print("opus-arbitration: unknown request", file=sys.stderr)
