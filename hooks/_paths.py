@@ -38,6 +38,7 @@ REGISTRY = {
         "~/.claude/agents/file-reader.md",
         "~/.claude/agents/file-writer.md",
         "~/.claude/agents/opus-judge.md",
+        "~/.claude/agents/opus-planner.md",
         "~/.claude/opus-arbitration-mode",
         "~/.claude/logs/opus-arbitration/**",
         "~/.agents/cursor-agent.md",

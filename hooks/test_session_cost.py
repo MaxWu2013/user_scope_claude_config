@@ -1300,6 +1300,7 @@ def test_arbitration_ledger(tally: Tally):
         ("worker", "toolu_worker", "claude-opus-5-5", 30, 3.5, "2026-06-01T00:02:00.000Z"),
         ("clerk", "toolu_clerk", "claude-sonnet-5-5", 40, 4.5, "2026-06-01T00:03:00.000Z"),
         ("stray", "toolu_stray", "claude-opus-5-5", 50, 5.5, "2026-06-01T00:04:00.000Z"),
+        ("planner", "toolu_planner", "claude-opus-5-5", 60, 6.5, "2026-06-01T00:05:00.000Z"),
     )
     spawns = [
         {
@@ -1351,7 +1352,7 @@ def test_arbitration_ledger(tally: Tally):
             encoding="utf-8",
         )
         entries.append(entry(timestamp, model, tokens, 0, cost))
-    ccusage_payload(payload, entries, 17.5, 150)
+    ccusage_payload(payload, entries, 24.0, 210)
     ledger = root / "ledger.db"
     conn = sqlite3.connect(ledger)
     conn.executescript(
@@ -1385,6 +1386,7 @@ def test_arbitration_ledger(tally: Tally):
             ("judge", SID, "judge"),
             ("worker", SID, "escalated"),
             ("clerk", SID, "routine"),
+            ("planner", SID, "planner"),
         ),
     )
     conn.execute(
@@ -1444,6 +1446,25 @@ def test_arbitration_ledger(tally: Tally):
         and "Agent spawn toolu_missing has no sub-agent transcript" in warning_text
         and "cost routine:" in human.stdout,
         "arb=%s warnings=%s" % (arb, warning_text),
+    )
+    bucket_names = ("main", "judge", "escalated_opus", "planner", "routine", "workflow_worker", "unclassified")
+    bucket_sum = sum(costs.get(name) or 0 for name in bucket_names)
+    agent_sum = sum(
+        agent["executor"]["cost"]
+        for agent in report["agents"]
+        if isinstance(agent.get("executor", {}).get("cost"), (int, float))
+    )
+    tally.check(
+        "planner cost lands in planner and buckets reconcile",
+        costs.get("planner") == 6.5
+        and costs.get("planner") == agent_by_id(report, "planner")["executor"]["cost"]
+        and abs(bucket_sum - agent_sum) < 0.001
+        and abs(bucket_sum - report["totals"]["executor_cost"]) < 0.001
+        and "cost planner:" in human.stdout
+        and "coverage_warning: unarbitrated_opus_agent planner" not in arb.get("coverage_warnings", []),
+        "costs=%s buckets=%s agents=%s total=%s" % (
+            costs, bucket_sum, agent_sum, report["totals"]["executor_cost"],
+        ),
     )
 
 

@@ -19,7 +19,9 @@ GUARD = ROOT / "opus-workflow-guard.py"
 WF = base.FIXTURES / "workflow"
 DELEGATION = (
     "WORKFLOW_WORKER_NO_DELEGATION; report NEEDS_JUDGMENT in your status footer instead, "
-    "and the main session will arbitrate"
+    "and the main session will arbitrate. When a checkpoint shows the plan is wrong, "
+    "report NEEDS_JUDGMENT with reason_code PLAN_REVISION_REQUIRED, the stage_id, a narrow "
+    "unresolved_question and evidence_refs, then stop. Do not delegate."
 )
 
 
@@ -403,9 +405,58 @@ def test_guard(suite):
         world.close()
 
 
+def test_replan_surface(suite):
+    world = base.World()
+    try:
+        base._enable_planning(world)
+        task_id = "guard-replan"
+        session_id = "sess-guard-replan"
+        version = base._publish_plan(session_id, task_id)["version"]
+        agent_id = "a" + "8" * 16
+        ready = base._reserve_worker(
+            world, session_id, task_id, version, "draft", "wf-guard", "prompt-guard", agent_id,
+        )
+        footer = base._replan_footer(task_id, "draft", version)
+        stop = json.loads(
+            (WF / "20261105T043812.562702Z-SubagentStop-none.json").read_text(encoding="utf-8")
+        )
+        stop["session_id"] = session_id
+        stop["cwd"] = str(world.project)
+        stop["transcript_path"] = str(world.opus_transcript)
+        stop["agent_id"] = agent_id
+        stop["last_assistant_message"] = json.dumps(footer)
+        stop.pop("agent_transcript_path", None)
+        stopped = run_guard(world, stop)
+        surfaced = run_guard(world, {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "session_id": session_id,
+            "cwd": str(world.project),
+            "tool_use_id": "guard-main",
+            "tool_input": {"file_path": "/tmp/readme"},
+        })
+        text = ""
+        try:
+            text = json.loads(surfaced.stdout)["hookSpecificOutput"]["additionalContext"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            text = surfaced.stdout
+        suite.check(
+            "R2",
+            "the guard surfaces one REPLAN_REQUIRED line",
+            ready and stopped.returncode == 0
+            and text.startswith("REPLAN_REQUIRED ")
+            and "drafts/%s.json" % task_id in text
+            and "router-plan promote %s" % task_id in text,
+            text[:300],
+        )
+    finally:
+        world.close()
+
+
 def main():
     suite = base.Suite()
     test_guard(suite)
+    test_replan_surface(suite)
     print("Tally: %s passed, %s failed" % (suite.passed, suite.failed))
     if suite.failures:
         print("\n".join(suite.failures))

@@ -13,7 +13,8 @@
     "judge_pending_ttl_seconds": 600,
     "judge_running_ttl_seconds": 900,
     "max_concurrent_judges_per_session": 1,
-    "max_concurrent_escalated_workers_per_session": 1
+    "max_concurrent_escalated_workers_per_session": 1,
+    "candidate_ttl_seconds": 1800
   },
   "unattended": {
     "max_judgments_per_session": 2,
@@ -30,5 +31,12 @@
     "max_workers_per_workflow": 12,
     "max_workers_per_session": 30,
     "require_mod_call_attestation": true
+  },
+  "planning": {
+    "enabled": false,
+    "planner_agent_type": "opus-planner",
+    "max_plan_versions_per_task": 3,
+    "max_replans_per_task": 2,
+    "max_steps": 12
   }
 }

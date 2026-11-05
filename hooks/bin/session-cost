@@ -1703,6 +1703,7 @@ def load_arbitration(session_id: str, agents: dict[str, dict], config=None) -> d
         "main": 0.0,
         "judge": 0.0,
         "escalated_opus": 0.0,
+        "planner": 0.0,
         "routine": 0.0,
         "workflow_worker": 0.0,
         "unclassified": 0.0,
@@ -1719,6 +1720,8 @@ def load_arbitration(session_id: str, agents: dict[str, dict], config=None) -> d
             bucket = "judge"
         elif kind == "escalated":
             bucket = "escalated_opus"
+        elif kind == "planner":
+            bucket = "planner"
         elif kind == "routine":
             bucket = "routine"
         elif kind == "workflow_worker":
@@ -1917,7 +1920,7 @@ def render_arbitration(report: dict) -> list[str]:
         lines.append("  available: false")
         return lines
     costs = arb.get("costs") or {}
-    for name in ("main", "judge", "escalated_opus", "routine", "workflow_worker", "unclassified"):
+    for name in ("main", "judge", "escalated_opus", "planner", "routine", "workflow_worker", "unclassified"):
         lines.append("  cost %s: %s" % (name, money(costs.get(name))))
     workers = arb.get("workflow_workers") or {}
     if workers:

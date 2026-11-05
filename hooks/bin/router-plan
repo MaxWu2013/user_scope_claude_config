@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Validate, store, and record router plans. Prints a JSON object last."""
+
+import os
+import sys
+
+sys.dont_write_bytecode = True
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+import _router_plans as plans
+
+
+if __name__ == "__main__":
+    sys.exit(plans.cli_main(sys.argv))

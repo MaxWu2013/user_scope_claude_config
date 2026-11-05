@@ -29,6 +29,15 @@ _LIMIT_KEYS = (
     "max_concurrent_judges_per_session",
     "max_concurrent_escalated_workers_per_session",
 )
+_CANDIDATE_TTL_SECONDS = 1800
+_PLANNING_DEFAULTS = {
+    "enabled": False,
+    "planner_agent_type": "opus-planner",
+    "max_plan_versions_per_task": 3,
+    "max_replans_per_task": 2,
+    "max_steps": 12,
+}
+_STAGE_FINISH = frozenset({"completed", "failed", "cancelled", "unknown"})
 _PURGE_INTERVAL = 3600
 _TERMINAL = frozenset({
     "JUDGED_CONTINUE",
@@ -41,9 +50,12 @@ _TERMINAL = frozenset({
     "EXPIRED",
     "CANCELLED",
     "FAILED_CLOSED",
+    "REPLAN_RESOLVED",
 })
 _EDGES = {
     ("CANDIDATE", "JUDGE_PENDING"),
+    ("CANDIDATE", "REPLAN_PENDING"),
+    ("REPLAN_PENDING", "REPLAN_RESOLVED"),
     ("JUDGE_PENDING", "JUDGE_RUNNING"),
     ("JUDGE_RUNNING", "JUDGED_CONTINUE"),
     ("JUDGE_RUNNING", "JUDGED_RETRY"),
@@ -107,7 +119,9 @@ _NEXT = {
 _JUDGE_STUCK_SECONDS = 120
 WORKER_NO_DELEGATION = (
     "WORKFLOW_WORKER_NO_DELEGATION; report NEEDS_JUDGMENT in your status footer instead, "
-    "and the main session will arbitrate"
+    "and the main session will arbitrate. When a checkpoint shows the plan is wrong, "
+    "report NEEDS_JUDGMENT with reason_code PLAN_REVISION_REQUIRED, the stage_id, a narrow "
+    "unresolved_question and evidence_refs, then stop. Do not delegate."
 )
 _WORKFLOW_DEFAULTS = {
     "opus_main_mode": "deny",
@@ -118,6 +132,8 @@ _WORKFLOW_DEFAULTS = {
     "max_workers_per_session": 30,
     "require_mod_call_attestation": True,
 }
+# A workflow recorded before stage_start denied it. The session cap ignores this.
+_WORKFLOW_CAP_IGNORED = "denied_stage"
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS requests (
     request_id TEXT PRIMARY KEY,
@@ -140,7 +156,9 @@ CREATE TABLE IF NOT EXISTS requests (
     created REAL,
     updated REAL,
     expires REAL,
-    context_json TEXT
+    context_json TEXT,
+    candidate_type TEXT DEFAULT 'EXECUTOR_ESCALATION',
+    plan_task_id TEXT
 );
 CREATE TABLE IF NOT EXISTS grants (
     grant_id TEXT PRIMARY KEY,
@@ -151,7 +169,8 @@ CREATE TABLE IF NOT EXISTS grants (
     expires REAL,
     uses_left INTEGER,
     consumed_tool_use_id TEXT,
-    consumed_at REAL
+    consumed_at REAL,
+    purpose TEXT DEFAULT 'EXECUTOR'
 );
 CREATE TABLE IF NOT EXISTS agent_runs (
     agent_id TEXT PRIMARY KEY,
@@ -198,6 +217,29 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
+);
+CREATE TABLE IF NOT EXISTS plans (
+    task_id TEXT,
+    version INTEGER,
+    content_sha256 TEXT,
+    scope_digest TEXT,
+    status TEXT,
+    session_id TEXT,
+    created REAL,
+    PRIMARY KEY (task_id, version)
+);
+CREATE TABLE IF NOT EXISTS stages (
+    task_id TEXT,
+    plan_version INTEGER,
+    stage_id TEXT,
+    attempt INTEGER,
+    session_id TEXT,
+    workflow_tool_use_id TEXT,
+    run_id TEXT,
+    status TEXT,
+    created REAL,
+    updated REAL,
+    PRIMARY KEY (task_id, plan_version, stage_id, attempt)
 );
 """
 
@@ -530,6 +572,8 @@ def load_policy():
     limits = data.get("limits")
     if not isinstance(limits, dict) or any(not _pos_int(limits.get(key)) for key in _LIMIT_KEYS):
         return None
+    if "candidate_ttl_seconds" in limits and not _pos_int(limits.get("candidate_ttl_seconds")):
+        return None
     unattended = data.get("unattended")
     if not isinstance(unattended, dict):
         return None
@@ -542,6 +586,19 @@ def load_policy():
     if not _pos_int(data.get("retention_days")):
         return None
     return data
+
+
+def _candidate_ttl(policy):
+    """Seconds a CANDIDATE may sit with no follow-through. Default 1800."""
+    if not isinstance(policy, dict):
+        return _CANDIDATE_TTL_SECONDS
+    limits = policy.get("limits")
+    if not isinstance(limits, dict) or "candidate_ttl_seconds" not in limits:
+        return _CANDIDATE_TTL_SECONDS
+    value = limits.get("candidate_ttl_seconds")
+    if _pos_int(value):
+        return value
+    return _CANDIDATE_TTL_SECONDS
 
 
 def effective_limits(policy):
@@ -728,6 +785,49 @@ def _migrate(conn):
         conn.execute("ALTER TABLE agent_runs ADD COLUMN workflow_id TEXT")
     if "verified_family" not in runs:
         conn.execute("ALTER TABLE agent_runs ADD COLUMN verified_family TEXT")
+    requests = {row[1] for row in conn.execute("PRAGMA table_info(requests)")}
+    if "candidate_type" not in requests:
+        conn.execute(
+            "ALTER TABLE requests ADD COLUMN candidate_type TEXT DEFAULT 'EXECUTOR_ESCALATION'"
+        )
+    if "plan_task_id" not in requests:
+        conn.execute("ALTER TABLE requests ADD COLUMN plan_task_id TEXT")
+    grants = {row[1] for row in conn.execute("PRAGMA table_info(grants)")}
+    if "purpose" not in grants:
+        conn.execute("ALTER TABLE grants ADD COLUMN purpose TEXT DEFAULT 'EXECUTOR'")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS plans (
+            task_id TEXT,
+            version INTEGER,
+            content_sha256 TEXT,
+            scope_digest TEXT,
+            status TEXT,
+            session_id TEXT,
+            created REAL,
+            PRIMARY KEY (task_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS stages (
+            task_id TEXT,
+            plan_version INTEGER,
+            stage_id TEXT,
+            attempt INTEGER,
+            session_id TEXT,
+            workflow_tool_use_id TEXT,
+            run_id TEXT,
+            status TEXT,
+            created REAL,
+            updated REAL,
+            PRIMARY KEY (task_id, plan_version, stage_id, attempt)
+        );
+        CREATE TABLE IF NOT EXISTS surface_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            line TEXT,
+            created REAL
+        );
+        """
+    )
 
 
 def _event(conn, event, request_id=None, session_id=None, task_id=None, trigger=None, extra=None, project=None):
@@ -874,30 +974,47 @@ def _purge(conn, now, policy):
     _mark_purged(conn, now)
 
 
+def _expire_follow_through(conn, request_id, from_state, decision=None):
+    fields = {}
+    if decision is not None:
+        fields["decision"] = decision
+    _transition(conn, request_id, "EXPIRED", **fields)
+    _event(conn, "no_follow_through", request_id=request_id, extra={"from_state": from_state})
+
+
 def _sweep(conn, now):
     policy = load_policy()
     if policy:
         _purge(conn, now, policy)
-    conn.execute(
-        """UPDATE requests SET state='EXPIRED', updated=?
-           WHERE state='JUDGE_PENDING' AND expires IS NOT NULL AND expires < ?""",
-        (now, now),
-    )
-    conn.execute(
-        """UPDATE requests SET state='EXPIRED', updated=?
+    ttl = _candidate_ttl(policy)
+    stale = conn.execute(
+        """SELECT request_id, state FROM requests
+           WHERE state IN ('CANDIDATE', 'JUDGE_PENDING', 'REPLAN_PENDING')
+             AND (
+                 (expires IS NOT NULL AND expires < ?)
+                 OR (state='CANDIDATE' AND expires IS NULL AND COALESCE(created, 0) + ? < ?)
+             )""",
+        (now, ttl, now),
+    ).fetchall()
+    for row in stale:
+        _expire_follow_through(conn, row["request_id"], row["state"], "NO_FOLLOW_THROUGH")
+    ready = conn.execute(
+        """SELECT request_id FROM requests
            WHERE state='GRANT_READY' AND expires IS NOT NULL AND expires < ?""",
-        (now, now),
-    )
+        (now,),
+    ).fetchall()
+    for row in ready:
+        _expire_follow_through(conn, row["request_id"], "GRANT_READY")
     conn.execute(
         """UPDATE grants SET uses_left=0
            WHERE expires < ? AND uses_left > 0
              AND request_id IN (SELECT request_id FROM requests WHERE state='EXPIRED')""",
         (now,),
     )
-    ttl = 900
+    running_ttl = 900
     if policy:
-        ttl = effective_limits(policy)["judge_running_ttl_seconds"]
-    cutoff = now - ttl
+        running_ttl = effective_limits(policy)["judge_running_ttl_seconds"]
+    cutoff = now - running_ttl
     stuck = conn.execute(
         """SELECT request_id FROM requests
            WHERE state='JUDGE_RUNNING' AND COALESCE(updated, created, 0) < ?""",
@@ -907,14 +1024,30 @@ def _sweep(conn, now):
         _fail_closed(conn, row["request_id"], "judge_timeout")
 
 
+# Opus-main replans never enter the judge. promote_pending is the only writer
+# of packet_digest, and it runs on the transition into JUDGE_PENDING. The judge
+# run then stores judge_tool_use_id. An Opus-main REPLAN_REQUEST takes
+# REPLAN_PENDING instead, so both columns stay null through REPLAN_RESOLVED and
+# EXPIRED. Those rows did not spend a judgment. A Sonnet-main replan that did
+# reach the judge has a packet_digest and still counts. No extra column: the
+# two nulls are the marker that the judge path was never entered.
+_NOT_UNJUDGED_REPLAN = (
+    "AND NOT (IFNULL(candidate_type,'')='REPLAN_REQUEST' "
+    "AND packet_digest IS NULL AND judge_tool_use_id IS NULL)"
+)
+
+
 def _judgment_blocked(conn, limits, session_id, task_id):
+    not_replan = _NOT_UNJUDGED_REPLAN
     session_n = conn.execute(
-        "SELECT COUNT(*) AS n FROM requests WHERE session_id=? AND IFNULL(state,'')!='CANCELLED'",
+        "SELECT COUNT(*) AS n FROM requests WHERE session_id=? AND IFNULL(state,'')!='CANCELLED' "
+        + not_replan,
         (session_id,),
     ).fetchone()["n"]
     task_n = conn.execute(
         """SELECT COUNT(*) AS n FROM requests
-           WHERE session_id=? AND task_id=? AND IFNULL(state,'')!='CANCELLED'""",
+           WHERE session_id=? AND task_id=? AND IFNULL(state,'')!='CANCELLED' """
+        + not_replan,
         (session_id, task_id),
     ).fetchone()["n"]
     if session_n >= limits["max_judgments_per_session"]:
@@ -922,6 +1055,35 @@ def _judgment_blocked(conn, limits, session_id, task_id):
     if task_n >= limits["max_judgments_per_task"]:
         return True
     return False
+
+
+def _mark_stage_needs_judgment(conn, binding):
+    """Move the latest started attempt to needs_judgment. binding is (task, version, stage)."""
+    if not isinstance(binding, (tuple, list)) or len(binding) != 3:
+        return False
+    task_id, plan_version, stage_id = binding
+    now = time.time()
+    row = conn.execute(
+        """SELECT attempt FROM stages
+           WHERE task_id=? AND plan_version=? AND stage_id=? AND status='started'
+           ORDER BY attempt DESC LIMIT 1""",
+        (task_id, plan_version, stage_id),
+    ).fetchone()
+    if row is None:
+        return False
+    conn.execute(
+        """UPDATE stages SET status='needs_judgment', updated=?
+           WHERE task_id=? AND plan_version=? AND stage_id=? AND attempt=?""",
+        (now, task_id, plan_version, stage_id, row["attempt"]),
+    )
+    return True
+
+
+def _queue_surface(conn, session_id, line):
+    conn.execute(
+        "INSERT INTO surface_lines (session_id, line, created) VALUES (?,?,?)",
+        (session_id if isinstance(session_id, str) else "", line, time.time()),
+    )
 
 
 def register_candidate(
@@ -943,12 +1105,24 @@ def register_candidate(
     project="",
     task_excerpt="",
     description="",
+    candidate_type="EXECUTOR_ESCALATION",
+    plan_task_id=None,
+    key_override=None,
+    skip_judgment_quota=False,
+    mark_stage=None,
+    follow_state=None,
+    replan_cap=None,
+    surface_line=None,
+    context_extra=None,
 ):
     """Return the open request for this key, a new one, or QUOTA_EXHAUSTED."""
     policy = load_policy()
     if policy is None or not policy.get("enabled") or read_switch() != "active":
         return {"ok": False, "reason": "DISABLED", "request": None}
-    key = candidate_key(session_id, task_id, reason_code, scope_digest, failed_requirement_id)
+    if isinstance(key_override, str) and key_override:
+        key = key_override
+    else:
+        key = candidate_key(session_id, task_id, reason_code, scope_digest, failed_requirement_id)
     shown_description = description or summary or task_summary or ""
     context = {
         "task_summary": redact(task_summary or summary or "", 600),
@@ -962,6 +1136,9 @@ def register_candidate(
         "failed_requirement_id": failed_requirement_id or "",
         "scope_digest": scope_digest or "",
     }
+    if isinstance(context_extra, dict):
+        for extra_key, extra_value in context_extra.items():
+            context[str(extra_key)] = extra_value
     with _db() as conn:
         with _Tx(conn):
             now = time.time()
@@ -970,6 +1147,8 @@ def register_candidate(
                 "SELECT * FROM requests WHERE candidate_key=?", (key,)
             ).fetchone()
             if existing is not None and existing["state"] not in _TERMINAL:
+                if mark_stage is not None:
+                    _mark_stage_needs_judgment(conn, mark_stage)
                 _event(conn, "candidate_deduped", request_id=existing["request_id"])
                 return {"ok": True, "created": False, "request": _request_dict(existing), "reason": None}
             if existing is not None:
@@ -986,8 +1165,29 @@ def register_candidate(
                     "decision": decided,
                     "request": _request_dict(existing),
                 }
+            if type(replan_cap) is int:
+                counted = conn.execute(
+                    """SELECT COUNT(*) AS n FROM requests
+                       WHERE plan_task_id=? AND candidate_type='REPLAN_REQUEST'
+                         AND IFNULL(state,'')!='CANCELLED'""",
+                    (plan_task_id if isinstance(plan_task_id, str) and plan_task_id else task_id,),
+                ).fetchone()["n"]
+                if counted >= replan_cap:
+                    if mark_stage is not None:
+                        _mark_stage_needs_judgment(conn, mark_stage)
+                    if isinstance(surface_line, str) and surface_line:
+                        _queue_surface(conn, session_id, surface_line)
+                    _event(
+                        conn,
+                        "replan_limit",
+                        session_id=session_id,
+                        task_id=task_id,
+                        extra={"reason": "replan_limit"},
+                    )
+                    return {"ok": False, "reason": "REPLAN_BLOCKED", "request": None}
             limits = effective_limits(policy)
-            if _judgment_blocked(conn, limits, session_id, task_id):
+            candidate_expires = now + _candidate_ttl(policy)
+            if not skip_judgment_quota and _judgment_blocked(conn, limits, session_id, task_id):
                 _event(
                     conn,
                     "quota_exhausted",
@@ -999,12 +1199,14 @@ def register_candidate(
                 return {"ok": False, "reason": "QUOTA_EXHAUSTED", "request": None}
             request_id = "esc-" + secrets.token_hex(8)
             stored_project = project if isinstance(project, str) else ""
+            stored_type = candidate_type if isinstance(candidate_type, str) and candidate_type else "EXECUTOR_ESCALATION"
+            stored_plan_task = plan_task_id if isinstance(plan_task_id, str) and plan_task_id else None
             conn.execute(
                 """INSERT INTO requests (
                        request_id, session_id, project, task_id, candidate_key, trigger, reason_code,
                        requester_agent_type, state, pending_digest, pending_summary,
-                       created, updated, context_json
-                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       created, updated, expires, context_json, candidate_type, plan_task_id
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     request_id,
                     session_id,
@@ -1019,10 +1221,17 @@ def register_candidate(
                     redact(summary or "", 200),
                     now,
                     now,
+                    candidate_expires,
                     json.dumps(context, sort_keys=True, ensure_ascii=False, separators=(",", ":")),
+                    stored_type,
+                    stored_plan_task,
                 ),
             )
             _event(conn, "candidate_registered", request_id=request_id, extra={"summary": redact(summary or "", 200)})
+            if mark_stage is not None:
+                _mark_stage_needs_judgment(conn, mark_stage)
+            if follow_state == "REPLAN_PENDING":
+                _transition(conn, request_id, "REPLAN_PENDING")
             row = conn.execute("SELECT * FROM requests WHERE request_id=?", (request_id,)).fetchone()
             return {"ok": True, "created": True, "request": _request_dict(row), "reason": None}
 
@@ -1069,17 +1278,31 @@ def evidence_sizes(request):
     }
 
 
+def _requested_capability(request):
+    kind = request.get("candidate_type") if isinstance(request, dict) else None
+    if kind in ("PLAN_REQUEST", "REPLAN_REQUEST"):
+        return "PLAN_ONLY"
+    return "EXECUTOR"
+
+
 def build_judge_packet(request):
     """Deterministic judge prompt body. No markers.
 
     current_model_observed is the model that would otherwise run, not the
-    requested Opus family. See _packet_body.
+    requested Opus family. See _packet_body. The digest is the hash of this
+    final text, including the candidate_type and requested_capability lines.
     """
+    if not isinstance(request, dict):
+        request = {}
     obj = _packet_body(request)
     body = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    text = "ARBITRATION-PACKET request_id=%s\n%s\nReturn only the decision JSON described in your instructions." % (
-        obj["request_id"],
-        body,
+    kind = request.get("candidate_type") or "EXECUTOR_ESCALATION"
+    text = (
+        "ARBITRATION-PACKET request_id=%s\n%s\n"
+        "candidate_type: %s\n"
+        "requested_capability: %s\n"
+        "Return only the decision JSON described in your instructions."
+        % (obj["request_id"], body, kind, _requested_capability(request))
     )
     return canonicalize_packet(text)
 
@@ -1090,19 +1313,22 @@ def format_candidate_request(request, permission_mode=None):
         return ""
     request_id = request.get("request_id") or ""
     trigger = request.get("trigger") or ""
+    kind_note = ""
+    if request.get("candidate_type") == "REPLAN_REQUEST":
+        kind_note = " candidate_type: REPLAN_REQUEST."
     if permission_mode == "auto":
         packet = request.get("packet_text") or ""
         return (
-            "ARBITRATION_CANDIDATE request_id=%s trigger=%s. Launch the Agent tool now, "
+            "ARBITRATION_CANDIDATE request_id=%s trigger=%s.%s Launch the Agent tool now, "
             'foreground, subagent_type "opus-judge", description "Judge %s", and copy this prompt exactly:\n'
             "<<<PACKET\n%s\nPACKET>>>"
-            % (request_id, trigger, request_id, packet)
+            % (request_id, trigger, kind_note, request_id, packet)
         )
     return (
-        "ARBITRATION_CANDIDATE request_id=%s trigger=%s. Launch the Agent tool now, "
+        "ARBITRATION_CANDIDATE request_id=%s trigger=%s.%s Launch the Agent tool now, "
         'foreground, subagent_type "opus-judge", description "Judge %s", '
         'prompt exactly "ARBITRATION-PACKET request_id=%s" (the hook inserts the full packet).'
-        % (request_id, trigger, request_id, request_id)
+        % (request_id, trigger, kind_note, request_id, request_id)
     )
 
 
@@ -1139,7 +1365,23 @@ def promote_pending(request_id):
             return _request_dict(fresh)
 
 
-def register_unapproved(session_id, tool_input, family, observed, project=""):
+def plan_task_from_prompt(prompt):
+    """Task id from a leading ROUTER-TASK line, or None when it does not match."""
+    if not isinstance(prompt, str) or prompt == "":
+        return None
+    lines = prompt.splitlines()
+    if not lines:
+        return None
+    match = re.fullmatch(r"ROUTER-TASK[ \t]+([A-Za-z0-9._-]{1,64})", lines[0])
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def register_unapproved(
+    session_id, tool_input, family, observed, project="",
+    candidate_type="EXECUTOR_ESCALATION", plan_task_id=None,
+):
     """T02: record the exact Opus call and return its judge packet."""
     digest = invocation_digest(session_id, tool_input, family)
     subagent_type = _subagent_type(tool_input)
@@ -1163,6 +1405,8 @@ def register_unapproved(session_id, tool_input, family, observed, project=""):
         current_model_observed=observed or "",
         allowed_scope_digest=digest,
         project=project if isinstance(project, str) else "",
+        candidate_type=candidate_type,
+        plan_task_id=plan_task_id,
     )
     if not result["ok"]:
         return result
@@ -1457,8 +1701,51 @@ def _worker_quota_ok(conn, policy, session_id, task_id):
     return True
 
 
+def _compose_replan_invocation(request):
+    """One PLAN_ONLY opus-planner call. The prompt is bounded and redacted."""
+    import _router_plans as plans
+
+    planner = planning_config()["planner_agent_type"]
+    task_id = request.get("plan_task_id") or request.get("task_id") or ""
+    stage_id = request.get("stage_id") if isinstance(request.get("stage_id"), str) else ""
+    question = redact(request.get("unresolved_question") or "", 300)
+    failed = request.get("failed_requirement_ids") if isinstance(request.get("failed_requirement_ids"), list) else []
+    completed = request.get("completed_stage_ids") if isinstance(request.get("completed_stage_ids"), list) else []
+    evidence = request.get("evidence_refs") if isinstance(request.get("evidence_refs"), list) else []
+    record = None
+    snap = ""
+    try:
+        record = plans.load_current(task_id)
+        if isinstance(record, dict):
+            snap = plans.snapshot(record)
+    except Exception:
+        record = None
+        snap = ""
+    version = request.get("plan_version")
+    if isinstance(record, dict) and type(record.get("version")) is int:
+        version = record["version"]
+    prompt = "\n".join((
+        "ROUTER-TASK %s" % task_id,
+        redact(snap, 4000),
+        "unresolved_question: %s" % question,
+        "failed_requirement_ids: %s" % redact(json.dumps(failed, sort_keys=True), 500),
+        "completed_stage_ids: %s" % redact(json.dumps(completed, sort_keys=True), 500),
+        "evidence_refs: %s" % redact(json.dumps(evidence, sort_keys=True), 500),
+        "Return plan schema v1 with base_plan_version=%s." % version,
+    ))
+    return {
+        "subagent_type": planner,
+        "model": "opus",
+        "run_in_background": False,
+        "description": "Router replan %s %s" % (task_id, stage_id),
+        "prompt": prompt,
+    }
+
+
 def compose_worker_invocation(request, decision):
     """Controller-owned worker call used when the candidate had no pending digest."""
+    if isinstance(request, dict) and request.get("candidate_type") == "REPLAN_REQUEST":
+        return _compose_replan_invocation(request)
     requester = request.get("requester_agent_type") or ""
     subagent_type = requester if requester in _WORKER_TYPES else "general-purpose"
     evidence = decision.get("evidence_used") if isinstance(decision, dict) else []
@@ -1522,12 +1809,18 @@ def _issue_grant(conn, request, decision, policy):
     pending = request.get("pending_digest") or ""
     worker = None
     invocation_json = None
+    # A missing digest, including REPLAN_REQUEST, is composed by compose_worker_invocation.
     if pending:
         digest = pending
     else:
         worker = compose_worker_invocation(request, decision)
         digest = invocation_digest(request.get("session_id") or "", worker, "opus")
         invocation_json = _canonical_json(worker)
+    purpose = (
+        "PLAN_ONLY"
+        if request.get("candidate_type") in ("PLAN_REQUEST", "REPLAN_REQUEST")
+        else "EXECUTOR"
+    )
     limits = effective_limits(policy)
     now = time.time()
     expires = now + limits["grant_ttl_seconds"]
@@ -1537,8 +1830,8 @@ def _issue_grant(conn, request, decision, policy):
     conn.execute(
         """INSERT INTO grants (
                grant_id, request_id, session_id, invocation_digest, invocation_json,
-               expires, uses_left
-           ) VALUES (?,?,?,?,?,?,1)""",
+               expires, uses_left, purpose
+           ) VALUES (?,?,?,?,?,?,1,?)""",
         (
             grant_id,
             request["request_id"],
@@ -1546,6 +1839,7 @@ def _issue_grant(conn, request, decision, policy):
             digest,
             invocation_json,
             expires,
+            purpose,
         ),
     )
     _event(
@@ -1726,11 +2020,80 @@ def ingest_judge_result(payload):
         return _result(None, failed_closed=True, reason="judge_ingest_error", request_id=request_id or "")
 
 
-def consume_grant(session_id, digest, tool_use_id):
+def _grant_purpose(row):
+    if row is None:
+        return "EXECUTOR"
+    try:
+        value = row["purpose"]
+    except (IndexError, KeyError):
+        return "EXECUTOR"
+    if value in ("PLAN_ONLY", "EXECUTOR"):
+        return value
+    return "EXECUTOR"
+
+
+def _purpose_allows(purpose, subagent_type):
+    """False when a grant's purpose does not match the caller."""
+    planner = planning_config()["planner_agent_type"]
+    is_planner = isinstance(planner, str) and planner != "" and subagent_type == planner
+    if purpose == "PLAN_ONLY" and not is_planner:
+        return False
+    if is_planner and purpose != "PLAN_ONLY":
+        return False
+    return True
+
+
+def _ready_grant(conn, session_id, digest, now):
+    return conn.execute(
+        """SELECT g.grant_id, g.request_id, g.purpose, g.invocation_digest FROM grants g
+           JOIN requests r ON r.request_id = g.request_id
+           WHERE g.session_id=? AND g.invocation_digest=? AND g.uses_left>0
+             AND g.expires>? AND r.state='GRANT_READY'
+           ORDER BY g.expires
+           LIMIT 1""",
+        (session_id, digest, now),
+    ).fetchone()
+
+
+def _purpose_conflict_grant(conn, session_id, tool_input, family, now):
+    """A ready grant for the same prompt under another role, with the wrong purpose.
+
+    The invocation digest includes subagent_type, so a general-purpose call
+    does not match a planner grant by digest. Compare the digest the call
+    would have had as the other role. A conflict does not consume the grant.
+    """
+    if not isinstance(tool_input, dict):
+        return None
+    caller = _subagent_type(tool_input)
+    planner = planning_config()["planner_agent_type"]
+    if not isinstance(planner, str) or planner == "":
+        return None
+    if caller == planner:
+        others = ("general-purpose", "file-reader", "file-writer")
+    else:
+        others = (planner,)
+    stored_family = family if isinstance(family, str) else ""
+    for other in others:
+        alt = dict(tool_input)
+        alt["subagent_type"] = other
+        row = _ready_grant(conn, session_id, invocation_digest(session_id, alt, stored_family), now)
+        if row is None:
+            continue
+        if not _purpose_allows(_grant_purpose(row), caller):
+            return row
+    return None
+
+
+def _purpose_mismatch():
+    return {"allow": False, "reason": "GRANT_PURPOSE_MISMATCH"}
+
+
+def consume_grant(session_id, digest, tool_use_id, tool_input=None, family=""):
     """Atomically use one matching grant.
 
     A repeated tool_use_id allows only when that grant's session and invocation
-    digest both match this call. Any other replay denies.
+    digest both match this call. Any other replay denies. A purpose mismatch
+    denies and does not consume the grant.
     """
     if not isinstance(session_id, str) or not isinstance(digest, str) or not isinstance(tool_use_id, str):
         return None
@@ -1750,20 +2113,17 @@ def consume_grant(session_id, digest, tool_use_id):
                         "allow": True,
                         "grant_id": replay["grant_id"],
                         "request_id": replay["request_id"],
+                        "purpose": _grant_purpose(replay),
                         "idempotent": True,
                     }
                 return {"allow": False, "reason": "replay_mismatch"}
-            row = conn.execute(
-                """SELECT g.grant_id, g.request_id FROM grants g
-                   JOIN requests r ON r.request_id = g.request_id
-                   WHERE g.session_id=? AND g.invocation_digest=? AND g.uses_left>0
-                     AND g.expires>? AND r.state='GRANT_READY'
-                   ORDER BY g.expires
-                   LIMIT 1""",
-                (session_id, digest, now),
-            ).fetchone()
+            row = _ready_grant(conn, session_id, digest, now)
             if row is None:
+                if _purpose_conflict_grant(conn, session_id, tool_input, family, now) is not None:
+                    return _purpose_mismatch()
                 return None
+            if not _purpose_allows(_grant_purpose(row), _subagent_type(tool_input)):
+                return _purpose_mismatch()
             updated = conn.execute(
                 """UPDATE grants SET uses_left=uses_left-1, consumed_tool_use_id=?, consumed_at=?
                    WHERE grant_id=? AND uses_left>0""",
@@ -1782,6 +2142,7 @@ def consume_grant(session_id, digest, tool_use_id):
                 "allow": True,
                 "grant_id": row["grant_id"],
                 "request_id": row["request_id"],
+                "purpose": _grant_purpose(row),
                 "idempotent": False,
             }
 
@@ -1818,11 +2179,12 @@ def consume_grant_reference(session_id, request_id, tool_input, tool_use_id):
                         "invocation": stored,
                         "grant_id": replay["grant_id"],
                         "request_id": replay["request_id"],
+                        "purpose": _grant_purpose(replay),
                         "idempotent": True,
                     }
                 return {"allow": False, "reason": "GRANT_MISMATCH"}
             row = conn.execute(
-                """SELECT g.grant_id, g.request_id, g.invocation_json, g.invocation_digest
+                """SELECT g.grant_id, g.request_id, g.invocation_json, g.invocation_digest, g.purpose
                    FROM grants g
                    JOIN requests r ON r.request_id = g.request_id
                    WHERE g.request_id=? AND g.session_id=? AND g.uses_left>0
@@ -1831,6 +2193,8 @@ def consume_grant_reference(session_id, request_id, tool_input, tool_use_id):
             ).fetchone()
             if row is None:
                 return {"allow": False, "reason": "GRANT_MISMATCH"}
+            if not _purpose_allows(_grant_purpose(row), _subagent_type(tool_input)):
+                return _purpose_mismatch()
             stored = _load_invocation(row["invocation_json"])
             if stored is None or not grant_call_matches(tool_input, stored):
                 return {"allow": False, "reason": "GRANT_MISMATCH"}
@@ -1853,6 +2217,7 @@ def consume_grant_reference(session_id, request_id, tool_input, tool_use_id):
                 "invocation": stored,
                 "grant_id": row["grant_id"],
                 "request_id": row["request_id"],
+                "purpose": _grant_purpose(row),
                 "idempotent": False,
             }
 
@@ -2100,7 +2465,7 @@ def record_launched_run(payload, kind, request_id=None):
     its name or tool_use_id when PostToolUse never runs. PostToolUse fills in
     agent_id, resolved_model, and the final status.
     """
-    if kind not in ("judge", "escalated") or not isinstance(payload, dict):
+    if kind not in ("judge", "escalated", "planner") or not isinstance(payload, dict):
         return None
     tool_use_id = payload.get("tool_use_id") if isinstance(payload.get("tool_use_id"), str) else ""
     if tool_use_id == "":
@@ -2209,13 +2574,13 @@ def record_agent_result(payload):
                 if judge is not None:
                     request_id = judge["request_id"]
             elif grant is not None:
-                kind = "escalated"
+                kind = "planner" if _grant_purpose(grant) == "PLAN_ONLY" else "escalated"
                 request_id = grant["request_id"]
             _save_agent_run(
                 conn, agent_id, session_id, project, agent_type, resolved, kind, request_id,
                 tool_use_id, run_status, now, agent_name,
             )
-            if kind == "escalated" and request_id:
+            if kind in ("escalated", "planner") and request_id:
                 state = conn.execute(
                     "SELECT state FROM requests WHERE request_id=?", (request_id,)
                 ).fetchone()
@@ -2250,6 +2615,107 @@ def record_agent_result(payload):
                 "request_id": request_id,
                 "unarbitrated": unarbitrated,
             }
+
+
+def _last_json_object(text):
+    """Last JSON object in text, using the same raw_decode scan as footers."""
+    if not isinstance(text, str) or text.strip() == "":
+        return None
+    decoder = json.JSONDecoder()
+    found = None
+    index = 0
+    while index < len(text):
+        if text[index] != "{":
+            index += 1
+            continue
+        try:
+            obj, end = decoder.raw_decode(text, index)
+        except json.JSONDecodeError:
+            index += 1
+            continue
+        if isinstance(obj, dict):
+            found = obj
+        index = max(end, index + 1)
+    return found
+
+
+def ingest_planner_result(payload):
+    """Validate a finished planner. Never promotes, mints a grant, or writes a plan."""
+    if not isinstance(payload, dict):
+        return ""
+    response = payload.get("tool_response")
+    if not isinstance(response, dict):
+        return ""
+    policy = load_policy()
+    accepted = policy.get("accepted_opus_models") if isinstance(policy, dict) else None
+    if not isinstance(accepted, list):
+        accepted = []
+    resolved = response.get("resolvedModel") if isinstance(response.get("resolvedModel"), str) else ""
+    agent_id = response.get("agentId") if isinstance(response.get("agentId"), str) else ""
+    tool_use_id = payload.get("tool_use_id") if isinstance(payload.get("tool_use_id"), str) else ""
+    session_id = payload.get("session_id") if isinstance(payload.get("session_id"), str) else ""
+    parts = []
+    content = response.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+    text = "".join(parts)
+    with _db() as conn:
+        with _Tx(conn):
+            grant = None
+            if tool_use_id:
+                grant = conn.execute(
+                    "SELECT request_id FROM grants WHERE consumed_tool_use_id=?",
+                    (tool_use_id,),
+                ).fetchone()
+            request_id = grant["request_id"] if grant is not None else None
+            if resolved not in accepted:
+                _event(
+                    conn, "planner_wrong_model", request_id=request_id, session_id=session_id,
+                    extra={"resolved_model": resolved},
+                )
+                return "PLANNER_RESULT_REJECTED reason=wrong_model"
+            path = subagent_transcript_path(payload, agent_id)
+            readable, models = _assistant_models(path)
+            if not readable or not models:
+                _event(
+                    conn, "coverage_warning", request_id=request_id, session_id=session_id,
+                    extra={"agent_id": agent_id},
+                )
+            elif any(model not in accepted for model in models):
+                _event(
+                    conn, "planner_wrong_model", request_id=request_id, session_id=session_id,
+                    extra={"resolved_model": resolved, "transcript_model": models[0]},
+                )
+                return "PLANNER_RESULT_REJECTED reason=wrong_model"
+            import _router_plans as plans
+
+            obj = _last_json_object(text)
+            max_steps = planning_config(policy)["max_steps"]
+            errors = plans.validate_plan(obj, max_steps=max_steps) if obj is not None else ["PLAN_NOT_OBJECT"]
+            if errors:
+                shown = errors[:5]
+                _event(
+                    conn, "planner_output_invalid", request_id=request_id, session_id=session_id,
+                    extra={"errors": shown},
+                )
+                return (
+                    "PLANNER_PLAN_INVALID: %s. No new planner grant; plan at Sonnet level or stop."
+                    % ", ".join(shown)
+                )
+            sha = plans.content_sha256(obj)
+            task_id = obj.get("task_id") if isinstance(obj.get("task_id"), str) else ""
+            _event(
+                conn, "planner_output_valid", request_id=request_id, session_id=session_id,
+                extra={"content_sha256": sha, "task_id": task_id},
+            )
+            return (
+                "PLANNER_PLAN_VALID task=%s sha256=%s. Review it, save it to "
+                "~/.claude/plans/router/drafts/%s.json and run "
+                "~/.claude/hooks/bin/router-plan promote %s <file>."
+                % (task_id, sha, task_id, task_id)
+            )
 
 
 def judge_is_running(tool_use_id):
@@ -2308,14 +2774,14 @@ def _upsert_failed_agent(conn, payload):
             (tool_use_id,),
         ).fetchone()
         grant = conn.execute(
-            "SELECT request_id FROM grants WHERE consumed_tool_use_id=?",
+            "SELECT request_id, purpose FROM grants WHERE consumed_tool_use_id=?",
             (tool_use_id,),
         ).fetchone()
     if judge is not None or agent_type == judge_type:
         kind = "judge"
         request_id = judge["request_id"] if judge is not None else None
     elif grant is not None:
-        kind = "escalated"
+        kind = "planner" if _grant_purpose(grant) == "PLAN_ONLY" else "escalated"
         request_id = grant["request_id"]
     else:
         return None
@@ -2514,7 +2980,7 @@ def _cancel_open():
         with _Tx(conn):
             now = time.time()
             rows = conn.execute(
-                "SELECT request_id FROM requests WHERE state IN ('JUDGE_PENDING', 'GRANT_READY')"
+                "SELECT request_id FROM requests WHERE state IN ('JUDGE_PENDING', 'GRANT_READY', 'REPLAN_PENDING')"
             ).fetchall()
             for row in rows:
                 _transition(conn, row["request_id"], "CANCELLED")
@@ -2657,6 +3123,238 @@ def _grant_public(item, now):
     }
 
 
+def record_plan_version(session_id, task_id, version, content_sha256, scope_digest):
+    """Insert an active plan row and supersede older versions of the task."""
+    with _db() as conn:
+        with _Tx(conn):
+            now = time.time()
+            _sweep(conn, now)
+            conn.execute(
+                "UPDATE plans SET status='superseded' WHERE task_id=? AND status='active'",
+                (task_id,),
+            )
+            conn.execute(
+                """INSERT INTO plans (
+                       task_id, version, content_sha256, scope_digest, status, session_id, created
+                   ) VALUES (?,?,?,?, 'active', ?, ?)""",
+                (task_id, version, content_sha256, scope_digest, session_id, now),
+            )
+
+
+def active_plan_version(task_id):
+    if not os.path.lexists(ledger_path()):
+        return None
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT version FROM plans WHERE task_id=? AND status='active'",
+            (task_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return row["version"]
+
+
+def _stage_block(conn, task_id, plan_version, stage_id):
+    """(ok, code, rows) for one stage. A yielded or finished attempt is never re-dispatched."""
+    rows = conn.execute(
+        """SELECT status, attempt FROM stages
+           WHERE task_id=? AND plan_version=? AND stage_id=?""",
+        (task_id, plan_version, stage_id),
+    ).fetchall()
+    statuses = [row["status"] for row in rows]
+    if any(item in ("started", "completed", "needs_judgment") for item in statuses):
+        return (False, "ROUTER_STAGE_DUPLICATE", rows)
+    if any(item == "unknown" for item in statuses):
+        return (False, "ROUTER_STAGE_UNKNOWN", rows)
+    active = conn.execute(
+        "SELECT version FROM plans WHERE task_id=? AND status='active'",
+        (task_id,),
+    ).fetchone()
+    if active is None or active["version"] != plan_version:
+        return (False, "ROUTER_PLAN_STALE", rows)
+    return (True, "OK", rows)
+
+
+def stage_check(task_id, plan_version, stage_id):
+    """Read-only stage_start. Same deny codes, no insert and no sweep.
+
+    The gate runs this before accept_workflow. stage_start is still the
+    atomic reservation and denies a race this pre-check missed. A missing
+    ledger has no active plan, so the result is ROUTER_PLAN_STALE and the
+    store is left uncreated.
+    """
+    if not os.path.lexists(ledger_path()):
+        return (False, "ROUTER_PLAN_STALE")
+    with _db() as conn:
+        ok, code, _rows = _stage_block(conn, task_id, plan_version, stage_id)
+        return (ok, code)
+
+
+def stage_start(session_id, task_id, plan_version, stage_id, workflow_tool_use_id=None):
+    """Start one stage attempt. Returns (ok, code, attempt)."""
+    with _db() as conn:
+        with _Tx(conn):
+            now = time.time()
+            _sweep(conn, now)
+            ok, code, rows = _stage_block(conn, task_id, plan_version, stage_id)
+            if not ok:
+                return (False, code, None)
+            attempt = 1
+            if rows:
+                attempt = max(row["attempt"] for row in rows) + 1
+            try:
+                conn.execute(
+                    """INSERT INTO stages (
+                           task_id, plan_version, stage_id, attempt, session_id,
+                           workflow_tool_use_id, run_id, status, created, updated
+                       ) VALUES (?,?,?,?,?,?,NULL,'started',?,?)""",
+                    (
+                        task_id,
+                        plan_version,
+                        stage_id,
+                        attempt,
+                        session_id,
+                        workflow_tool_use_id,
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return (False, "ROUTER_STAGE_DUPLICATE", None)
+            return (True, "OK", attempt)
+
+
+def stage_finish(task_id, plan_version, stage_id, status):
+    """Close the latest started or needs_judgment attempt. False if there is none."""
+    if status not in _STAGE_FINISH:
+        return False
+    with _db() as conn:
+        with _Tx(conn):
+            now = time.time()
+            _sweep(conn, now)
+            row = conn.execute(
+                """SELECT attempt FROM stages
+                   WHERE task_id=? AND plan_version=? AND stage_id=?
+                     AND status IN ('started', 'needs_judgment')
+                   ORDER BY attempt DESC LIMIT 1""",
+                (task_id, plan_version, stage_id),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute(
+                """UPDATE stages SET status=?, updated=?
+                   WHERE task_id=? AND plan_version=? AND stage_id=? AND attempt=?""",
+                (status, now, task_id, plan_version, stage_id, row["attempt"]),
+            )
+            return True
+
+
+def stages_open(session_id=None):
+    """Rows in started or needs_judgment. Optional session filter."""
+    if not os.path.lexists(ledger_path()):
+        return []
+    with _db() as conn:
+        if session_id is None:
+            rows = conn.execute(
+                """SELECT * FROM stages
+                   WHERE status IN ('started', 'needs_judgment')
+                   ORDER BY created"""
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT * FROM stages
+                   WHERE status IN ('started', 'needs_judgment') AND session_id=?
+                   ORDER BY created""",
+                (session_id,),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def task_stages(task_id):
+    if not os.path.lexists(ledger_path()):
+        return []
+    with _db() as conn:
+        rows = conn.execute(
+            """SELECT * FROM stages WHERE task_id=?
+               ORDER BY plan_version, stage_id, attempt""",
+            (task_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def resolve_open_replans(task_id, reason):
+    """Resolve every open REPLAN_PENDING row for this plan task. Returns the count."""
+    if not isinstance(task_id, str) or task_id == "":
+        return 0
+    with _db() as conn:
+        with _Tx(conn):
+            _sweep(conn, time.time())
+            rows = conn.execute(
+                """SELECT request_id FROM requests
+                   WHERE plan_task_id=? AND state='REPLAN_PENDING'""",
+                (task_id,),
+            ).fetchall()
+            for row in rows:
+                _transition(conn, row["request_id"], "REPLAN_RESOLVED", decision=reason)
+            return len(rows)
+
+
+def resolve_replan(request_id, reason):
+    """Move REPLAN_PENDING to REPLAN_RESOLVED. Any other state returns False."""
+    with _db() as conn:
+        with _Tx(conn):
+            _sweep(conn, time.time())
+            row = conn.execute(
+                "SELECT state FROM requests WHERE request_id=?",
+                (request_id,),
+            ).fetchone()
+            if row is None or row["state"] != "REPLAN_PENDING":
+                return False
+            _transition(conn, request_id, "REPLAN_RESOLVED", decision=reason)
+            return True
+
+
+def unresolved_follow_through(now=None):
+    """EXPIRED no-follow-through rows created in the last 7 days."""
+    if not os.path.lexists(ledger_path()):
+        return []
+    moment = time.time() if now is None else now
+    cutoff = moment - 7 * 86400
+    with _db() as conn:
+        rows = conn.execute(
+            """SELECT * FROM requests
+               WHERE state='EXPIRED' AND created >= ?
+                 AND (
+                     decision='NO_FOLLOW_THROUGH'
+                     OR request_id IN (
+                         SELECT request_id FROM events WHERE event='no_follow_through'
+                     )
+                 )
+               ORDER BY created""",
+            (cutoff,),
+        ).fetchall()
+        items = []
+        for row in rows:
+            data = _request_dict(row)
+            event = conn.execute(
+                """SELECT detail_json FROM events
+                   WHERE request_id=? AND event='no_follow_through'
+                   ORDER BY id DESC LIMIT 1""",
+                (row["request_id"],),
+            ).fetchone()
+            from_state = ""
+            if event is not None and isinstance(event["detail_json"], str) and event["detail_json"]:
+                try:
+                    detail = json.loads(event["detail_json"])
+                except json.JSONDecodeError:
+                    detail = None
+                if isinstance(detail, dict) and isinstance(detail.get("from_state"), str):
+                    from_state = detail["from_state"]
+            data["from_state"] = from_state
+            items.append(data)
+    return items
+
+
 def cmd_status():
     print("switch: %s" % read_switch())
     policy = load_policy()
@@ -2686,6 +3384,48 @@ def cmd_status():
         print(
             "  %s request=%s session=%s expires=%s uses_left=%s"
             % (item["grant_id"], item["request_id"], item["session_id"], item["expires"], item["uses_left"])
+        )
+    print("unresolved (no follow-through, 7d):")
+    unresolved = unresolved_follow_through()
+    if not unresolved:
+        print("  (none)")
+    for item in unresolved:
+        print(
+            "  %s trigger=%s reason_code=%s from_state=%s created=%s"
+            % (
+                item.get("request_id") or "",
+                item.get("trigger") or "",
+                item.get("reason_code") or "",
+                item.get("from_state") or "",
+                item.get("created") if item.get("created") is not None else "",
+            )
+        )
+    print("stages open:")
+    # Workflow PostToolUseFailure does not reach the post hook: settings.json
+    # matches Agent|Bash only. A stage left started is closed with
+    # router-plan stage finish <task> <version> <stage> --status failed.
+    # Rows open for more than an hour are marked stale.
+    open_stages = stages_open()
+    if not open_stages:
+        print("  (none)")
+    moment = time.time()
+    for item in open_stages:
+        created = item.get("created")
+        stale = ""
+        if isinstance(created, (int, float)) and not isinstance(created, bool) and moment - created >= 3600:
+            stale = " stale"
+        print(
+            "  task=%s plan_version=%s stage=%s attempt=%s status=%s session=%s created=%s%s"
+            % (
+                item.get("task_id") or "",
+                item.get("plan_version") if item.get("plan_version") is not None else "",
+                item.get("stage_id") or "",
+                item.get("attempt") if item.get("attempt") is not None else "",
+                item.get("status") or "",
+                item.get("session_id") or "",
+                created if created is not None else "",
+                stale,
+            )
         )
     return 0
 
@@ -2729,6 +3469,40 @@ def _env_positive_int(name):
     if text == "" or not text.isdigit():
         return None
     return int(text)
+
+
+def planning_config(policy=None):
+    """Planning caps. A missing or malformed block is disabled and never raises.
+
+    load_policy does not require the block.
+    """
+    config = dict(_PLANNING_DEFAULTS)
+    if policy is None:
+        policy = load_policy()
+    if not isinstance(policy, dict):
+        return config
+    if "planning" not in policy or policy.get("planning") is None:
+        return config
+    raw = policy.get("planning")
+    if not isinstance(raw, dict):
+        return dict(_PLANNING_DEFAULTS)
+    enabled = raw.get("enabled", False)
+    planner = raw.get("planner_agent_type", config["planner_agent_type"])
+    versions = raw.get("max_plan_versions_per_task", config["max_plan_versions_per_task"])
+    replans = raw.get("max_replans_per_task", config["max_replans_per_task"])
+    steps = raw.get("max_steps", config["max_steps"])
+    if not isinstance(enabled, bool):
+        return dict(_PLANNING_DEFAULTS)
+    if not isinstance(planner, str) or planner == "":
+        return dict(_PLANNING_DEFAULTS)
+    if not _pos_int(versions) or not _pos_int(replans) or not _pos_int(steps):
+        return dict(_PLANNING_DEFAULTS)
+    config["enabled"] = enabled
+    config["planner_agent_type"] = planner
+    config["max_plan_versions_per_task"] = versions
+    config["max_replans_per_task"] = replans
+    config["max_steps"] = steps
+    return config
 
 
 def workflow_config(policy=None):
@@ -2789,9 +3563,11 @@ def accept_workflow(payload, expected_family, limit=None):
                 (tool_use_id,),
             ).fetchone()
             if existing is None and limit is not None:
+                # denied_stage was counted, then the stage reservation lost.
+                # It must not keep the slot.
                 count = conn.execute(
-                    "SELECT COUNT(*) AS n FROM workflows WHERE session_id=?",
-                    (session_id,),
+                    "SELECT COUNT(*) AS n FROM workflows WHERE session_id=? AND IFNULL(status,'')!=?",
+                    (session_id, _WORKFLOW_CAP_IGNORED),
                 ).fetchone()["n"]
                 if count >= limit:
                     return False
@@ -2811,8 +3587,32 @@ def accept_workflow(payload, expected_family, limit=None):
             return True
 
 
+def release_workflow(tool_use_id):
+    """Stop a launched workflow from counting after its stage reservation lost.
+
+    Sets status to denied_stage. accept_workflow ignores that status. A missing
+    row returns False.
+    """
+    if not isinstance(tool_use_id, str) or tool_use_id == "":
+        return False
+    with _db() as conn:
+        with _Tx(conn):
+            cur = conn.execute(
+                "UPDATE workflows SET status=? WHERE tool_use_id=? AND status='launched'",
+                (_WORKFLOW_CAP_IGNORED, tool_use_id),
+            )
+            return cur.rowcount > 0
+
+
 def note_workflow_result(payload):
-    """Fill run id, task id, and name from a Workflow PostToolUse response."""
+    """Fill run id, task id, and name from a Workflow PostToolUse response.
+
+    When a stage was reserved for this tool use, store run_id on that row.
+    Do not mark the stage completed. Only router-plan stage finish does that,
+    after the main session checks the evidence. A Workflow failure does not
+    reach this hook (PostToolUseFailure matches Agent|Bash only); close a
+    stuck stage with router-plan stage finish … --status failed.
+    """
     if not isinstance(payload, dict):
         return None
     response = payload.get("tool_response")
@@ -2831,6 +3631,11 @@ def note_workflow_result(payload):
                    WHERE tool_use_id=?""",
                 (run_id, task_id, name, tool_use_id),
             )
+            if run_id:
+                conn.execute(
+                    "UPDATE stages SET run_id=?, updated=? WHERE workflow_tool_use_id=?",
+                    (run_id, time.time(), tool_use_id),
+                )
     return tool_use_id
 
 
@@ -2978,6 +3783,131 @@ def peek_grant_invocation(session_id, request_id):
         return raw if isinstance(raw, str) and raw else None
 
 
+def pending_replan_requests(session_id):
+    """Open Opus-main replan requests for one session."""
+    if not isinstance(session_id, str) or session_id == "":
+        return []
+    with _db() as conn:
+        rows = conn.execute(
+            """SELECT * FROM requests
+               WHERE session_id=? AND state='REPLAN_PENDING' AND candidate_type='REPLAN_REQUEST'
+               ORDER BY created""",
+            (session_id,),
+        ).fetchall()
+        return [_request_dict(row) for row in rows]
+
+
+def format_replan_required(request):
+    """One REPLAN_REQUIRED line for an open Opus-main replan."""
+    if not isinstance(request, dict) or request.get("state") != "REPLAN_PENDING":
+        return ""
+    request_id = request.get("request_id") or ""
+    task = request.get("plan_task_id") or request.get("task_id") or ""
+    version = request.get("plan_version")
+    stage = request.get("stage_id") if isinstance(request.get("stage_id"), str) else ""
+    question = redact(request.get("unresolved_question") or "", 200)
+    return (
+        "REPLAN_REQUIRED request_id=%s task=%s plan_version=%s stage=%s question=%s. "
+        "Revise the plan yourself (no judge needed): save it to ~/.claude/plans/router/drafts/%s.json "
+        "with base_plan_version=%s, run router-plan promote %s <file> --resolves %s, "
+        "then start a fresh Workflow stage only if the remaining work needs parallel fan-out."
+        % (request_id, task, version, stage, question, task, version, task, request_id)
+    )
+
+
+def take_surface_lines(session_id):
+    """Return queued surface lines for this session and delete them."""
+    if not isinstance(session_id, str) or session_id == "":
+        return []
+    if not os.path.lexists(ledger_path()):
+        return []
+    with _db() as conn:
+        with _Tx(conn):
+            rows = conn.execute(
+                "SELECT line FROM surface_lines WHERE session_id=? ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            if rows:
+                conn.execute("DELETE FROM surface_lines WHERE session_id=?", (session_id,))
+            return [row["line"] for row in rows if isinstance(row["line"], str) and row["line"]]
+
+
+def note_replan_blocked(session_id, task_id, plan_version, stage_id, reason, project=""):
+    """Record a replan that was not registered, and queue one surface line."""
+    line = "REPLAN_BLOCKED task=%s stage=%s reason=%s" % (task_id, stage_id, reason)
+    event = "replan_limit" if reason == "replan_limit" else "replan_blocked"
+    with _db() as conn:
+        with _Tx(conn):
+            _sweep(conn, time.time())
+            _mark_stage_needs_judgment(conn, (task_id, plan_version, stage_id))
+            _queue_surface(conn, session_id, line)
+            _event(
+                conn,
+                event,
+                session_id=session_id,
+                task_id=task_id,
+                project=project if isinstance(project, str) else "",
+                extra={"reason": reason, "stage_id": stage_id},
+            )
+    write_surface_flag(session_id)
+    return line
+
+
+def replan_candidate_key(task_id, plan_version, stage_id, reason_code):
+    """One replan per task version, stage, and reason. Session is not part of the key."""
+    raw = "%s|%s|%s|%s" % (task_id or "", plan_version, stage_id or "", reason_code or "")
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def correlated_stage(agent_id, stage_id, plan_version):
+    """Stage row when the worker's workflow and the footer name the same open stage.
+
+    The row must be started or needs_judgment, and its plan_version must be the
+    task's active version. needs_judgment is that same dispatch after the first
+    worker asked for a replan, so a second worker still shares it. A finished
+    status, or a plan version that is no longer active, does not correlate.
+    Uses only ledger rows. Footer fields alone never count.
+    """
+    if not isinstance(agent_id, str) or agent_id == "":
+        return None
+    if not isinstance(stage_id, str) or stage_id == "" or type(plan_version) is not int:
+        return None
+    if not os.path.lexists(ledger_path()):
+        return None
+    with _db() as conn:
+        run = conn.execute(
+            "SELECT workflow_id FROM agent_runs WHERE agent_id=?",
+            (agent_id,),
+        ).fetchone()
+        if run is None or not isinstance(run["workflow_id"], str) or run["workflow_id"] == "":
+            return None
+        workflow = conn.execute(
+            "SELECT tool_use_id FROM workflows WHERE tool_use_id=?",
+            (run["workflow_id"],),
+        ).fetchone()
+        if workflow is None:
+            return None
+        stage = conn.execute(
+            """SELECT * FROM stages
+               WHERE workflow_tool_use_id=?
+               ORDER BY attempt DESC LIMIT 1""",
+            (workflow["tool_use_id"],),
+        ).fetchone()
+        if stage is None:
+            return None
+        if stage["stage_id"] != stage_id or stage["plan_version"] != plan_version:
+            return None
+        if stage["status"] not in ("started", "needs_judgment"):
+            return None
+        active = conn.execute(
+            "SELECT version FROM plans WHERE task_id=? AND status='active'",
+            (stage["task_id"],),
+        ).fetchone()
+        if active is None or active["version"] != stage["plan_version"]:
+            return None
+        return dict(stage)
+
+
 def pending_workflow_candidates(session_id):
     """JUDGE_PENDING workflow-worker requests for one session."""
     if not isinstance(session_id, str) or session_id == "":
@@ -3027,8 +3957,98 @@ def write_surface_flag(session_id):
     return path
 
 
+def _main_family(payload):
+    """Main-session family from a payload model, else the transcript tail."""
+    if isinstance(payload, dict):
+        raw = payload.get("model")
+        if isinstance(raw, str) and raw.strip():
+            family = _agent_model._model_family(raw)
+            if family in ("opus", "sonnet", "haiku"):
+                return family
+    return _agent_model.main_session_model(payload)
+
+
+def _try_replan(payload, footer, model_id):
+    """Register a correlated replan, or None when the footer is not a replan.
+
+    An uncorrelated PLAN_* footer returns None so the generic path is unchanged.
+    A blocked replan returns a result and does not create a candidate.
+    """
+    reason = footer.get("reason_code")
+    if reason not in ("PLAN_REQUIRED", "PLAN_REVISION_REQUIRED"):
+        return None
+    refs = footer.get("evidence_refs")
+    if not isinstance(refs, list) or not any(isinstance(item, str) and item for item in refs):
+        return None
+    session_id = payload.get("session_id") if isinstance(payload.get("session_id"), str) else ""
+    agent_id = payload.get("agent_id") if isinstance(payload.get("agent_id"), str) else ""
+    project = project_of(payload)
+    stage = correlated_stage(agent_id, footer.get("stage_id"), footer.get("plan_version"))
+    if stage is None:
+        record_event(
+            "replan_uncorrelated",
+            session_id=session_id,
+            project=project,
+            extra={"agent_id": agent_id},
+        )
+        return None
+    task_id = stage.get("task_id") or ""
+    plan_version = stage.get("plan_version")
+    stage_id = stage.get("stage_id") or ""
+    planning = planning_config()
+    if not planning.get("enabled"):
+        note_replan_blocked(session_id, task_id, plan_version, stage_id, "planning_disabled", project)
+        return {"ok": False, "reason": "REPLAN_BLOCKED", "request": None}
+    family = _main_family(payload)
+    opus = family == "opus"
+    observed = model_id if isinstance(model_id, str) else ""
+    import _opus_triggers as triggers
+
+    context_extra = {
+        "stage_id": stage_id,
+        "plan_version": plan_version,
+        "unresolved_question": footer.get("unresolved_question") or "",
+        "failed_requirement_ids": footer.get("failed_requirement_ids") or [],
+        "completed_stage_ids": footer.get("completed_stage_ids") or [],
+        "evidence_refs": [item for item in refs if isinstance(item, str)],
+    }
+    result = register_candidate(
+        session_id=session_id,
+        task_id=task_id,
+        trigger="WORKFLOW_WORKER_REQUEST",
+        reason_code=reason,
+        requester_agent_type="general-purpose",
+        scope_digest=replan_candidate_key(task_id, plan_version, stage_id, reason),
+        task_summary=footer.get("unresolved_question") or footer.get("suggested_scope") or task_id,
+        current_model_observed=observed,
+        objective_failure_evidence=triggers._footer_evidence(footer),
+        prior_attempts=footer.get("attempts") if isinstance(footer.get("attempts"), list) else [],
+        project=project,
+        candidate_type="REPLAN_REQUEST",
+        plan_task_id=task_id,
+        key_override=replan_candidate_key(task_id, plan_version, stage_id, reason),
+        skip_judgment_quota=opus,
+        mark_stage=(task_id, plan_version, stage_id),
+        follow_state="REPLAN_PENDING" if opus else None,
+        replan_cap=planning["max_replans_per_task"],
+        surface_line="REPLAN_BLOCKED task=%s stage=%s reason=replan_limit" % (task_id, stage_id),
+        context_extra=context_extra,
+    )
+    if not isinstance(result, dict):
+        return result
+    if result.get("reason") == "REPLAN_BLOCKED":
+        write_surface_flag(session_id)
+        return result
+    if not opus and result.get("ok"):
+        result = triggers._ready(result)
+    request = result.get("request") if isinstance(result, dict) else None
+    if isinstance(request, dict) and request.get("state") in ("REPLAN_PENDING", "JUDGE_PENDING"):
+        write_surface_flag(session_id)
+    return result
+
+
 def register_workflow_candidate(payload, model_id):
-    """Turn a worker footer into JUDGE_PENDING and raise the surface flag."""
+    """Turn a worker footer into a replan or a JUDGE_PENDING candidate."""
     if not isinstance(payload, dict):
         return None
     text = payload.get("last_assistant_message")
@@ -3039,6 +4059,9 @@ def register_workflow_candidate(payload, model_id):
     footer = triggers.parse_footer(text)
     if not isinstance(footer, dict) or footer.get("status") != "NEEDS_JUDGMENT":
         return None
+    replan = _try_replan(payload, footer, model_id)
+    if replan is not None:
+        return replan
     unresolved = footer.get("unresolved") if isinstance(footer.get("unresolved"), list) else []
     attempts = footer.get("attempts") if isinstance(footer.get("attempts"), list) else []
     conflicting = footer.get("reason_code") == "CONFLICTING_REQUIREMENTS"

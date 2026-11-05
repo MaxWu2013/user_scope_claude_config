@@ -42,6 +42,11 @@ ARBITRATION_TASK = (
     "without a packet, and never use background or nested Opus agents."
 )
 ARBITRATION_STRICT = "Opus subagents are denied in strict mode; use sonnet or haiku."
+PLANNING_TASK = (
+    "Complex multi-stage work: if you are Opus, write the plan yourself and run router-plan promote; "
+    "use a Workflow only for parallel fan-out, passing router-plan snapshot text in args. "
+    "opus-planner is for Sonnet main sessions and needs arbitration."
+)
 
 
 def expected_text(mode, reads_routed):
@@ -49,6 +54,7 @@ def expected_text(mode, reads_routed):
     if mode == "task-aware":
         parts.append(DOC_TASK)
         parts.append(ARBITRATION_TASK)
+        parts.append(PLANNING_TASK)
         if reads_routed:
             parts.append(READ_TASK)
             parts.append(SAFE_READ)
@@ -127,7 +133,7 @@ def main():
         and isinstance(parsed, dict)
         and parsed.get("hookSpecificOutput", {}).get("hookEventName") == "SessionStart"
         and isinstance(text, str)
-        and len(text) <= 1100
+        and len(text) <= 1253
         and all(part in text for part in REQUIRED),
         f"exit={completed.returncode} stdout={completed.stdout!r} stderr={completed.stderr!r} parsed={parsed!r}",
     )
@@ -332,7 +338,7 @@ def text_cases(check):
                         and isinstance(parsed, dict)
                         and parsed.get("hookSpecificOutput", {}).get("hookEventName") == "SessionStart"
                         and got == expected
-                        and len(expected) <= 1100,
+                        and len(expected) <= 1253,
                         f"stdout={completed.stdout!r} stderr={completed.stderr!r}",
                     )
         check(

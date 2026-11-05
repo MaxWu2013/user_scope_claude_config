@@ -83,6 +83,8 @@ ORCH_BASH_WRITE_DENY = (
 )
 CURSOR_AGENT_DENY = "Start cursor-agent only through ~/.claude/hooks/bin/cursor-run <spec>."
 SESSION_COST_DENY = "session-cost must be invoked alone with plain arguments."
+ROUTER_PLAN_MAIN_ONLY = "router-plan is main-session only"
+ROUTER_PLAN_DENY = "router-plan must be invoked alone with plain arguments."
 WRITER_SEARCH_DENY = "file-writer may not search. Ask the file-reader subagent (Agent tool)."
 WRITER_READ_DENY = "file-writer may only Read documents."
 WRITER_OBSIDIAN_READ_DENY = "file-writer may not read the vault through Obsidian."
@@ -112,22 +114,100 @@ READ_CMD = re.compile(
 CURSOR_AGENT_RE = re.compile(r"(?:^|[\s;&|/])cursor-agent\b")
 
 
-def _home_command(binary):
+def _horizontal_home_command(binary):
+    """Hooks path with horizontal space only. A line break is not a separator."""
     home = re.escape(os.path.expanduser("~"))
-    return r"^\s*(?:~|" + home + r")/\.claude/hooks/bin/" + binary
+    return r"^[ \t]*(?:~|" + home + r")/\.claude/hooks/bin/" + re.escape(binary)
 
 
 def safe_read_re():
-    return re.compile(_home_command("safe-read") + r"(?:\s+" + _SAFE_ARG + r"*)?\s*$")
+    return re.compile(
+        _horizontal_home_command("safe-read") + r"(?:[ \t]+" + _SAFE_ARG + r"*)?[ \t]*$"
+    )
 
 
 def cursor_run_re():
-    return re.compile(_home_command("cursor-run") + r"\s+" + _SAFE_ARG + r"+$")
+    return re.compile(_horizontal_home_command("cursor-run") + r"[ \t]+" + _SAFE_ARG + r"+$")
+
+
+def safe_read_exact(raw):
+    """One single-line safe-read command. A line break never matches."""
+    if _command_has_break(raw):
+        return False
+    return safe_read_re().match(raw) is not None
+
+
+def cursor_run_exact(raw):
+    """One single-line cursor-run command. A line break never matches."""
+    if _command_has_break(raw):
+        return False
+    return cursor_run_re().match(raw) is not None
+
+
+def _line_break_hooks_deny(raw):
+    """Deny reason when a line break sits in a safe-read or cursor-run command.
+
+    Those allows are single-line. A break is not an exact command, and it must
+    not fall through to a silent allow.
+    """
+    if not _command_has_break(raw):
+        return None
+    if _hooks_binary_mentioned(raw, "cursor-run"):
+        return CURSOR_AGENT_DENY
+    if _hooks_binary_mentioned(raw, "safe-read"):
+        return (
+            "Not allowed here: reading files or full diffs through Bash. "
+            "Ask the file-reader subagent (Agent tool); batch your questions."
+        )
+    return None
+
+
+def _plain_hooks_re(binary):
+    """One hooks binary, optional leading tabs or spaces, then plain arguments.
+
+    Newlines are not whitespace here. Callers also reject a raw command that
+    contains a line break before matching, because $ accepts a final newline.
+    """
+    home = re.escape(os.path.expanduser("~"))
+    return re.compile(
+        r"^[ \t]*(?:~|" + home + r")/\.claude/hooks/bin/"
+        + re.escape(binary) + r"[ \t]+" + _SAFE_ARG + r"+$"
+    )
+
+
+def _command_has_break(raw):
+    return isinstance(raw, str) and ("\n" in raw or "\r" in raw)
 
 
 def session_cost_re():
     # One plain invocation: path, then arguments with no shell metacharacters.
-    return re.compile(_home_command("session-cost") + r"\s+" + _SAFE_ARG + r"+$")
+    return _plain_hooks_re("session-cost")
+
+
+def session_cost_exact(raw):
+    """True for one single-line session-cost command. A line break never matches."""
+    if _command_has_break(raw):
+        return False
+    return session_cost_re().match(raw) is not None
+
+
+def router_plan_re():
+    # Same shape as session-cost: the hooks path, then plain arguments only.
+    return _plain_hooks_re("router-plan")
+
+
+def router_plan_verdict(role, raw):
+    """'allow', 'main', 'form', or None when the command is not router-plan."""
+    if not isinstance(raw, str) or raw == "":
+        return None
+    exact = (not _command_has_break(raw)) and router_plan_re().match(raw) is not None
+    if not exact and not _hooks_binary_mentioned(raw, "router-plan"):
+        return None
+    if role != "orchestrator":
+        return "main"
+    if exact:
+        return "allow"
+    return "form"
 
 
 def _hooks_binary_mentioned(raw, binary):
@@ -1373,33 +1453,63 @@ def _without_stdin_filters(body, scanned, scrub):
     return "".join(out)
 
 
+def _router_plan_result(role, raw):
+    """Allow, deny, or None when the command is not router-plan."""
+    verdict = router_plan_verdict(role, raw)
+    if verdict == "allow":
+        return 0
+    if verdict == "main":
+        return deny(ROUTER_PLAN_MAIN_ONLY)
+    if verdict == "form":
+        return deny(ROUTER_PLAN_DENY)
+    return None
+
+
 def handle_bash(role, d, raw, paths):
     if not isinstance(raw, str):
         return 0
     _LOG["command"] = raw
+    # File-reader safe-read is decided before a router-plan mention, so an
+    # exact safe-read that only names the path stays allowed.
     if role == "file-reader":
-        if safe_read_re().match(raw) or session_cost_re().match(raw):
+        if safe_read_exact(raw) or session_cost_exact(raw):
             return 0
+        planned = _router_plan_result(role, raw)
+        if planned is not None:
+            return planned
         return deny(READER_BASH_DENY)
     if role == "file-writer":
+        planned = _router_plan_result(role, raw)
+        if planned is not None:
+            return planned
         return deny(WRITER_BASH_DENY)
     if role == "other":
+        planned = _router_plan_result(role, raw)
+        if planned is not None:
+            return planned
         return _other_bash(role, d, raw, paths)
 
     cmd = paths.scrub_command(paths.remove_quoted_spans(raw))
     body = paths.strip_heredoc_bodies(raw)
     scanned = paths.scrub_command(paths.remove_quoted_spans(body))
+    broken = _line_break_hooks_deny(raw)
+    if broken:
+        return deny(broken)
     if cursor_run_ready():
-        if cursor_run_re().match(raw):
+        if cursor_run_exact(raw):
             return 0
         if CURSOR_AGENT_RE.search(cmd):
             return deny(CURSOR_AGENT_DENY)
-    if safe_read_re().match(raw):
+    if safe_read_exact(raw):
         return 0
-    if session_cost_re().match(raw):
+    if session_cost_exact(raw):
         return 0
     if _hooks_binary_mentioned(raw, "session-cost"):
         return deny(SESSION_COST_DENY)
+    # Exact router-plan is allowed only after the cursor-agent deny.
+    planned = _router_plan_result(role, raw)
+    if planned is not None:
+        return planned
     if READ_CMD.search(_without_stdin_filters(body, scanned, paths.scrub_command)):
         return read_deny("reading files or full diffs through Bash")
     return _orch_bash_document_writes(scanned, paths)
@@ -1639,6 +1749,23 @@ def _all_writes_local(data, paths):
     raw = ti.get("command") or ""
     if not isinstance(raw, str):
         return 0
+    broken = _line_break_hooks_deny(raw)
+    if broken:
+        _arm_log(role, data, tool, ti, paths)
+        _LOG["command"] = raw
+        return deny(broken)
+    verdict = router_plan_verdict(role, raw)
+    if verdict is not None:
+        _arm_log(role, data, tool, ti, paths)
+        _LOG["command"] = raw
+        if verdict == "allow":
+            cmd = paths.scrub_command(paths.remove_quoted_spans(paths.strip_heredoc_bodies(raw)))
+            if cursor_run_ready() and CURSOR_AGENT_RE.search(cmd):
+                return deny(CURSOR_AGENT_DENY)
+            return 0
+        if verdict == "main":
+            return deny(ROUTER_PLAN_MAIN_ONLY)
+        return deny(ROUTER_PLAN_DENY)
     if role == "other":
         _arm_log(role, data, tool, ti, paths)
         _LOG["command"] = raw

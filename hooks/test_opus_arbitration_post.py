@@ -1018,6 +1018,183 @@ def test_auto_escalate(suite):
         world.close()
 
 
+def _planner_transcript(world, session_id, agent_id, model):
+    path = world.sonnet_transcript.parent / session_id / "subagents" / ("agent-%s.jsonl" % agent_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {"type": "assistant", "message": {"role": "assistant", "model": model, "content": [{"type": "text", "text": "ok"}]}}
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    return path
+
+
+def _finish_planner(world, session_id, tool_use_id, text, resolved, agent_id, transcript_model=None):
+    payload = base._planner_call(
+        world, session_id=session_id, tool_use_id="open-" + tool_use_id,
+        prompt="ROUTER-TASK " + session_id + "\nPlan " + session_id,
+        description="Plan " + session_id,
+    )
+    payload, request_id, result = base.escalate(world, payload)
+    kind, reason = base.verdict(base.run_gate(world, {**payload, "tool_use_id": tool_use_id}))
+    if kind != "allow":
+        raise AssertionError("planner grant %s %s" % (kind, reason[:200]))
+    _planner_transcript(world, session_id, agent_id, transcript_model or "claude-opus-5-5")
+    posted = base.judge_result(
+        world, request_id, tool_use_id, "CONTINUE",
+        session_id=session_id, agent_id=agent_id, text=text, resolved_model=resolved,
+        transcript=world.sonnet_transcript,
+    )
+    posted["tool_response"]["agentType"] = "opus-planner"
+    return request_id, result, run_post(world, posted)
+
+
+def test_planner_result(suite):
+    import _router_plans as plan_store
+
+    world = base.World()
+    try:
+        base._enable_planning(world)
+        base._planner_file(world)
+        plan = {
+            "schema_version": 1,
+            "task_id": "post-task",
+            "base_plan_version": 0,
+            "objective": "Ship the plan store",
+            "assumptions": ["The ledger is local"],
+            "invariants": ["Plans are not permissions"],
+            "steps": [{
+                "id": "draft",
+                "depends_on": [],
+                "executor_role": "main",
+                "allowed_model": "main",
+                "instructions": "Write the plan file",
+                "acceptance_checks": ["The file parses"],
+                "requires_user_approval": False,
+            }],
+            "risks": ["A stale write"],
+            "handoff_notes": "Hand off to the next work package",
+        }
+        sha = plan_store.content_sha256(plan)
+        before = len(base.rows(world, "grants"))
+        _request, _result, posted = _finish_planner(
+            world, "sess-valid", "tu-valid", json.dumps(plan), "claude-opus-5-5", "a" + "8" * 16,
+        )
+        text = context_of(posted)
+        events = (world.home / ".claude" / "logs" / "opus-arbitration" / "events.jsonl").read_text(encoding="utf-8")
+        runs = [row for row in base.rows(world, "agent_runs") if row.get("agent_id") == "a" + "8" * 16]
+        expected = (
+            "PLANNER_PLAN_VALID task=post-task sha256=%s. Review it, save it to "
+            "~/.claude/plans/router/drafts/post-task.json and run "
+            "~/.claude/hooks/bin/router-plan promote post-task <file>."
+            % sha
+        )
+        suite.check(
+            "P10",
+            "a valid planner result is recorded and not promoted",
+            posted.returncode == 0 and text == expected
+            and "planner_output_valid" in events
+            and runs and runs[-1].get("kind") == "planner"
+            and not (world.home / ".claude" / "plans" / "router" / "post-task").exists()
+            and len(base.rows(world, "grants")) == before + 1,
+            text[:300],
+        )
+        suite.check(
+            "P12",
+            "a granted planner run is not an unarbitrated Opus run",
+            "ARBITRATION_ALERT" not in text
+            and "unarbitrated_opus_run" not in events
+            and not any(row.get("unarbitrated") for row in runs),
+            text[:200],
+        )
+        _request, _result, invalid = _finish_planner(
+            world, "sess-invalid", "tu-invalid", "not a plan", "claude-opus-5-5", "a" + "6" * 16,
+        )
+        invalid_text = context_of(invalid)
+        invalid_events = (world.home / ".claude" / "logs" / "opus-arbitration" / "events.jsonl").read_text(encoding="utf-8")
+        suite.check(
+            "P10",
+            "a non-object planner result is invalid",
+            invalid_text == "PLANNER_PLAN_INVALID: PLAN_NOT_OBJECT. No new planner grant; plan at Sonnet level or stop."
+            and "planner_output_invalid" in invalid_events
+            and len(base.rows(world, "grants")) == before + 2,
+            invalid_text[:240],
+        )
+        _request, _result, wrong = _finish_planner(
+            world, "sess-wrong", "tu-wrong", json.dumps(plan), "claude-sonnet-5-5", "a" + "4" * 16,
+        )
+        wrong_text = context_of(wrong)
+        wrong_events = (world.home / ".claude" / "logs" / "opus-arbitration" / "events.jsonl").read_text(encoding="utf-8")
+        suite.check(
+            "P10",
+            "the wrong planner model is rejected",
+            wrong_text == "PLANNER_RESULT_REJECTED reason=wrong_model"
+            and "planner_wrong_model" in wrong_events
+            and len(base.rows(world, "grants")) == before + 3,
+            wrong_text[:240],
+        )
+        _request, _result, mixed = _finish_planner(
+            world, "sess-mixed", "tu-mixed", json.dumps(plan), "claude-opus-5-5", "a" + "3" * 16,
+            transcript_model="claude-sonnet-5-5",
+        )
+        mixed_text = context_of(mixed)
+        mixed_events = (world.home / ".claude" / "logs" / "opus-arbitration" / "events.jsonl").read_text(encoding="utf-8")
+        suite.check(
+            "P10b",
+            "an accepted resolved model with a foreign transcript model is rejected",
+            mixed_text == "PLANNER_RESULT_REJECTED reason=wrong_model"
+            and "planner_wrong_model" in mixed_events
+            and len(base.rows(world, "grants")) == before + 4,
+            mixed_text[:240],
+        )
+    finally:
+        world.close()
+
+
+def test_stage_result(suite):
+    world = base.World()
+    try:
+        task_id = "stage-task"
+        session_id = "sess-stage"
+        version = base._publish_plan(session_id, task_id)["version"]
+        agent_id = "a" + "5" * 16
+        ready = base._reserve_worker(
+            world, session_id, task_id, version, "draft", "wf-stage", "prompt-stage", agent_id,
+        )
+        posted = run_post(world, {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Workflow",
+            "session_id": session_id,
+            "cwd": str(world.project),
+            "tool_use_id": "wf-stage",
+            "tool_response": {"runId": "run-77", "taskId": "remote", "workflowName": "stage"},
+        })
+        import _opus_arbitration as arb
+
+        completed = {
+            "schema_version": 1,
+            "task_id": task_id,
+            "status": "COMPLETED",
+            "reason_code": "WORKER_REQUEST",
+        }
+        registered = arb.register_workflow_candidate({
+            "session_id": session_id,
+            "agent_id": agent_id,
+            "cwd": str(world.project),
+            "last_assistant_message": json.dumps(completed),
+        }, "claude-sonnet-5-5")
+        during = base._stage_rows(world, task_id, "draft")
+        finished = arb.stage_finish(task_id, version, "draft", "completed")
+        after = base._stage_rows(world, task_id, "draft")
+        suite.check(
+            "R10",
+            "a workflow result records the run and only stage finish completes it",
+            ready and posted.returncode == 0 and registered is None
+            and during and during[0]["status"] == "started" and during[0]["run_id"] == "run-77"
+            and finished is True and after[0]["status"] == "completed",
+            "during=%s after=%s" % (during, after),
+        )
+    finally:
+        world.close()
+
+
 def main():
     suite = base.Suite()
     test_decisions(suite)
@@ -1034,6 +1211,8 @@ def main():
     test_unarbitrated_alert(suite)
     test_failed_names_and_deadline(suite)
     test_auto_escalate(suite)
+    test_planner_result(suite)
+    test_stage_result(suite)
     suite.check(
         "REF",
         "gate output never contains permissionDecision allow",

@@ -60,6 +60,7 @@ PATHS = [
     ".claude/specs/t.diff",
     "~/.claude/settings.json",
     "../other/docs/x.txt",
+    "~/.claude/agents/opus-planner.md",
 ]
 
 NOTEBOOK_PATHS = ["src/a.ts", "README.md", "docs/plan.txt"]
@@ -112,6 +113,7 @@ EXPECTED = {
     ".claude/specs/t.diff": "code",
     "~/.claude/settings.json": "code",
     "../other/docs/x.txt": "document",
+    "~/.claude/agents/opus-planner.md": "document",
 }
 
 

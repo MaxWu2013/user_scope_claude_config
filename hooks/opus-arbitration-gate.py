@@ -159,8 +159,11 @@ def _accept_grant_reference(data, tool_input, session_id, request_id, tool_use_i
         return _deny_agent(data, reason)
     outcome = arb.consume_grant_reference(session_id, request_id, tool_input, tool_use_id)
     if isinstance(outcome, dict) and outcome.get("allow") is True and isinstance(outcome.get("invocation"), dict):
-        _remember_launched(data, "escalated", outcome.get("request_id"))
+        kind = "planner" if outcome.get("purpose") == "PLAN_ONLY" else "escalated"
+        _remember_launched(data, kind, outcome.get("request_id"))
         return _rewrite(outcome["invocation"])
+    if isinstance(outcome, dict) and outcome.get("reason") == "GRANT_PURPOSE_MISMATCH":
+        return _deny_agent(data, "GRANT_PURPOSE_MISMATCH")
     return _deny_agent(data, "GRANT_MISMATCH")
 
 
@@ -217,6 +220,103 @@ def _pinned_family(config):
     if family not in allowed:
         return None
     return family
+
+
+def _router_stage_gate(tool_input):
+    """None when args has no router_stage. Otherwise ('ok', stage) or ('deny', reason)."""
+    if not isinstance(tool_input, dict):
+        return None
+    args = tool_input.get("args")
+    if not isinstance(args, dict) or "router_stage" not in args:
+        return None
+    stage = args.get("router_stage")
+    if not isinstance(stage, dict) or set(stage) != {"task_id", "plan_version", "stage_id"}:
+        return ("deny", "ROUTER_STAGE_INVALID")
+    task_id = stage.get("task_id")
+    plan_version = stage.get("plan_version")
+    stage_id = stage.get("stage_id")
+    import _router_plans as plans
+
+    if not isinstance(task_id, str) or plans._TASK_ID_RE.fullmatch(task_id) is None:
+        return ("deny", "ROUTER_STAGE_INVALID")
+    if type(plan_version) is not int or plan_version < 1:
+        return ("deny", "ROUTER_STAGE_INVALID")
+    if not isinstance(stage_id, str) or plans._STEP_ID_RE.fullmatch(stage_id) is None:
+        return ("deny", "ROUTER_STAGE_INVALID")
+    if "opus" in json.dumps(args).lower():
+        return ("deny", "OPUS_WORKFLOW_DENIED reason=args")
+    return ("ok", stage)
+
+
+def _stage_deny_text(stage, code):
+    if code in ("ROUTER_PLAN_STALE", "ROUTER_STAGE_DUPLICATE", "ROUTER_STAGE_UNKNOWN"):
+        return "%s; run router-plan show %s" % (code, stage["task_id"])
+    return code or "ROUTER_STAGE_INVALID"
+
+
+def _reserve_stage(data, stage):
+    """Deny text when the stage cannot be reserved, else None."""
+    session_id = data.get("session_id") if isinstance(data.get("session_id"), str) else ""
+    tool_use_id = data.get("tool_use_id") if isinstance(data.get("tool_use_id"), str) else ""
+    ok, code, _attempt = arb.stage_start(
+        session_id,
+        stage["task_id"],
+        stage["plan_version"],
+        stage["stage_id"],
+        workflow_tool_use_id=tool_use_id or None,
+    )
+    if ok:
+        return None
+    return _stage_deny_text(stage, code)
+
+
+def _release_counted_workflow(data):
+    """Drop a slot that was counted before the stage reservation lost or raised."""
+    tool_use_id = ""
+    if isinstance(data, dict) and isinstance(data.get("tool_use_id"), str):
+        tool_use_id = data["tool_use_id"]
+    if tool_use_id == "":
+        return
+    try:
+        arb.release_workflow(tool_use_id)
+    except Exception:
+        pass
+
+
+def _finish_workflow(data, stage_gate):
+    """Reserve a router stage only after every other workflow check has passed.
+
+    Any error from the reservation denies ROUTER_STAGE_BUSY. A workflow that
+    carries router_stage must not fall through to the non-opus allow.
+    """
+    if not isinstance(stage_gate, tuple):
+        return 0
+    if stage_gate[0] != "ok":
+        return 0
+    try:
+        denied = _reserve_stage(data, stage_gate[1])
+    except Exception:
+        _release_counted_workflow(data)
+        return _deny_agent(data, "ROUTER_STAGE_BUSY")
+    if denied:
+        _release_counted_workflow(data)
+        return _deny_agent(data, denied)
+    return 0
+
+
+def _stage_precheck(stage_gate):
+    """Deny text from the read-only stage check, or None when the stage can start.
+
+    None when this call has no router_stage. Runs before accept_workflow so a
+    known deny does not spend a session slot. stage_start still reserves.
+    """
+    if not isinstance(stage_gate, tuple) or stage_gate[0] != "ok":
+        return None
+    stage = stage_gate[1]
+    ok, code = arb.stage_check(stage["task_id"], stage["plan_version"], stage["stage_id"])
+    if ok:
+        return None
+    return _stage_deny_text(stage, code)
 
 
 def _record_workflow(data, family, limit, proved):
@@ -327,20 +427,32 @@ def _runtime_attestations(data, config):
 
 
 def _workflow(data, proved):
-    """Allow a sonnet/haiku workflow, or an Opus main only under pinned env."""
+    """Allow a sonnet/haiku workflow, or an Opus main only under pinned env.
+
+    A router_stage is checked, then reserved only after every other precondition
+    has passed, so a denied Workflow never leaves a started stage row. A
+    reservation error denies ROUTER_STAGE_BUSY. Args without router_stage
+    behave as before.
+    """
     tool_input = _tool_input(data)
+    stage_gate = _router_stage_gate(tool_input)
+    if isinstance(stage_gate, tuple) and stage_gate[0] == "deny":
+        return _deny_agent(data, stage_gate[1])
     if _agent_model.workflow_structural_denies(tool_input):
         return _deny_agent(data, _WORKFLOW_DENY)
     main = _agent_model.main_session_model(data)
     if main in ("sonnet", "haiku"):
         if not _poll_file(_guard_attest_path(data)):
             return _deny_agent(data, "WORKFLOW_GUARD_NOT_ACTIVE")
+        blocked = _stage_precheck(stage_gate)
+        if blocked:
+            return _deny_agent(data, blocked)
         proved["non_opus"] = True
         try:
             arb.accept_workflow(data, main, None)
         except Exception:
             pass
-        return 0
+        return _finish_workflow(data, stage_gate)
     config = arb.workflow_config()
     if config.get("opus_main_mode") != "pinned_env":
         return _deny_agent(data, _WORKFLOW_MAIN_DENY)
@@ -356,9 +468,12 @@ def _workflow(data, proved):
     runtime = _runtime_attestations(data, config)
     if runtime:
         return _deny_agent(data, runtime)
+    blocked = _stage_precheck(stage_gate)
+    if blocked:
+        return _deny_agent(data, blocked)
     if not _record_workflow(data, family, config["max_workflows_per_session"], proved):
         return _deny_agent(data, _workflow_session_reason(config["max_workflows_per_session"]))
-    return 0
+    return _finish_workflow(data, stage_gate)
 
 
 def _skill(data, proved):
@@ -426,6 +541,27 @@ def _agent(data, proved):
         if is_judge:
             return _deny_agent(data, "JUDGE_NO_TOOL_USE_ID")
         return _deny_agent(data, "OPUS_NO_TOOL_USE_ID")
+    planning = arb.planning_config(policy if isinstance(policy, dict) else None)
+    planner_type = planning.get("planner_agent_type")
+    is_planner = (
+        isinstance(planner_type, str)
+        and planner_type != ""
+        and subagent_type == planner_type
+        and _agent_model.opus_possible(res)
+    )
+    if is_planner:
+        if not planning.get("enabled"):
+            return _deny_agent(data, "OPUS_PLANNER_DISABLED")
+        identity = _agent_model.planner_definition_status(data, planner_type)
+        if identity != "ok":
+            return _deny_agent(data, identity)
+        if _agent_model.main_session_model(data) == "opus":
+            return _deny_agent(
+                data,
+                "OPUS_PLANNER_NOT_NEEDED Main session is already Opus: write the plan yourself, "
+                "save it under ~/.claude/plans/router/drafts/ and run router-plan promote. "
+                "No judge is needed for your own reasoning.",
+            )
     if is_judge:
         if res.get("family") != "opus":
             return _deny_agent(data, "JUDGE_MODEL_MISMATCH")
@@ -453,11 +589,16 @@ def _agent(data, proved):
     if grant_ref is not None:
         return _accept_grant_reference(data, tool_input, session_id, grant_ref, tool_use_id)
     digest = arb.invocation_digest(session_id, tool_input, res.get("family") or "")
-    grant = arb.consume_grant(session_id, digest, tool_use_id)
+    grant = arb.consume_grant(
+        session_id, digest, tool_use_id, tool_input, res.get("family") or "",
+    )
     if isinstance(grant, dict) and grant.get("allow") is True:
-        _remember_launched(data, "escalated", grant.get("request_id"))
+        launched = "planner" if grant.get("purpose") == "PLAN_ONLY" else "escalated"
+        _remember_launched(data, launched, grant.get("request_id"))
         return 0
     if isinstance(grant, dict) and grant.get("allow") is False:
+        if grant.get("reason") == "GRANT_PURPOSE_MISMATCH":
+            return _deny_agent(data, "GRANT_PURPOSE_MISMATCH")
         return _deny_agent(data, "OPUS_GRANT_REPLAY_DENIED")
     # Baseline is the model that would otherwise run, not the requested family.
     observed = _agent_model.non_opus_baseline(data, tool_input)
@@ -467,6 +608,8 @@ def _agent(data, proved):
         res.get("family") or "",
         observed,
         project=arb.project_of(data),
+        candidate_type="PLAN_REQUEST" if is_planner else "EXECUTOR_ESCALATION",
+        plan_task_id=arb.plan_task_from_prompt(prompt) if is_planner else None,
     )
     if not result.get("ok"):
         if result.get("reason") == "ALREADY_DECIDED":

@@ -3286,6 +3286,1570 @@ def test_workflow_and_auto(suite):
         world.close()
 
 
+def test_plan_ledger(suite):
+    world = World()
+    try:
+        import sqlite3
+
+        ledger = world.home / ".claude" / "logs" / "opus-arbitration"
+        ledger.mkdir(parents=True)
+        db = ledger / "ledger.db"
+        conn = sqlite3.connect(db)
+        conn.executescript(
+            """
+            CREATE TABLE requests (
+                request_id TEXT PRIMARY KEY,
+                session_id TEXT,
+                project TEXT,
+                task_id TEXT,
+                candidate_key TEXT UNIQUE,
+                trigger TEXT,
+                reason_code TEXT,
+                requester_agent_type TEXT,
+                state TEXT,
+                pending_digest TEXT,
+                pending_summary TEXT,
+                packet_digest TEXT,
+                packet_text TEXT,
+                judge_tool_use_id TEXT,
+                judge_agent_id TEXT,
+                judge_model TEXT,
+                decision TEXT,
+                created REAL,
+                updated REAL,
+                expires REAL,
+                context_json TEXT
+            );
+            CREATE TABLE grants (
+                grant_id TEXT PRIMARY KEY,
+                request_id TEXT,
+                session_id TEXT,
+                invocation_digest TEXT,
+                invocation_json TEXT,
+                expires REAL,
+                uses_left INTEGER,
+                consumed_tool_use_id TEXT,
+                consumed_at REAL
+            );
+            CREATE TABLE agent_runs (
+                agent_id TEXT PRIMARY KEY,
+                session_id TEXT,
+                project TEXT,
+                agent_type TEXT,
+                resolved_model TEXT,
+                kind TEXT,
+                request_id TEXT,
+                tool_use_id TEXT,
+                status TEXT,
+                created REAL,
+                name TEXT,
+                workflow_id TEXT,
+                verified_family TEXT
+            );
+            CREATE TABLE workflows (
+                tool_use_id TEXT PRIMARY KEY,
+                session_id TEXT,
+                prompt_id TEXT,
+                project TEXT,
+                created REAL,
+                expected_family TEXT,
+                status TEXT,
+                run_id TEXT,
+                task_id TEXT,
+                workflow_name TEXT
+            );
+            CREATE TABLE attempts (
+                session_id TEXT,
+                task_id TEXT,
+                strategy_digest TEXT,
+                outcome TEXT,
+                created REAL
+            );
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT,
+                session_id TEXT,
+                event TEXT,
+                request_id TEXT,
+                detail_json TEXT
+            );
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+            """
+        )
+        conn.execute(
+            """INSERT INTO requests (
+                   request_id, session_id, task_id, trigger, reason_code, state, created, updated
+               ) VALUES (?,?,?,?,?,?,?,?)""",
+            ("keep-me", "sess-old", "old-task", "T02", "UNAPPROVED_OPUS", "JUDGED_CONTINUE", 10, 10),
+        )
+        conn.execute(
+            "INSERT INTO grants (grant_id, request_id, uses_left) VALUES ('g-old', 'keep-me', 1)"
+        )
+        conn.commit()
+        conn.close()
+        arb.active_plan_version("none")
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        req_cols = {row[1] for row in conn.execute("PRAGMA table_info(requests)")}
+        grant_cols = {row[1] for row in conn.execute("PRAGMA table_info(grants)")}
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        kept = dict(conn.execute("SELECT * FROM requests WHERE request_id='keep-me'").fetchone())
+        grant = dict(conn.execute("SELECT * FROM grants WHERE grant_id='g-old'").fetchone())
+        conn.close()
+        suite.check(
+            "P1",
+            "old ledger gains plan columns and keeps its row",
+            "candidate_type" in req_cols
+            and "plan_task_id" in req_cols
+            and "purpose" in grant_cols
+            and "plans" in tables
+            and "stages" in tables
+            and kept["request_id"] == "keep-me"
+            and kept["state"] == "JUDGED_CONTINUE"
+            and kept["candidate_type"] == "EXECUTOR_ESCALATION"
+            and kept["plan_task_id"] is None
+            and grant["purpose"] == "EXECUTOR"
+            and grant["uses_left"] == 1,
+            "row=%s grant=%s" % (kept, grant),
+        )
+
+        def register(session_id, task_id):
+            return arb.register_candidate(
+                session_id=session_id,
+                task_id=task_id,
+                trigger="T02",
+                reason_code="UNAPPROVED_OPUS",
+                scope_digest=task_id,
+                summary="follow through",
+            )
+
+        created = register("sess-ft", "ft-task")
+        request_id = created["request"]["request_id"]
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE requests SET expires=? WHERE request_id=?",
+            (time.time() - 5, request_id),
+        )
+        conn.commit()
+        conn.close()
+        arb.record_event("tick-ft", session_id="sess-ft")
+        shown = arb.show_request(request_id)
+        follow = [
+            row for row in rows(world, "events")
+            if row["event"] == "no_follow_through" and row["request_id"] == request_id
+        ]
+        suite.check(
+            "P1",
+            "candidate past its ttl expires with no follow-through",
+            created["ok"]
+            and shown["state"] == "EXPIRED"
+            and shown["decision"] == "NO_FOLLOW_THROUGH"
+            and follow
+            and '"from_state":"CANDIDATE"' in (follow[-1]["detail_json"] or ""),
+            "state=%s decision=%s events=%s" % (
+                shown and shown.get("state"), shown and shown.get("decision"), follow,
+            ),
+        )
+        legacy_created = time.time() - 4000
+        conn = sqlite3.connect(db)
+        conn.execute(
+            """INSERT INTO requests (
+                   request_id, session_id, task_id, trigger, reason_code, state, created, updated, expires
+               ) VALUES (?,?,?,?,?,?,?,?,NULL)""",
+            (
+                "legacy-1", "sess-legacy", "legacy-task", "T02", "UNAPPROVED_OPUS",
+                "CANDIDATE", legacy_created, legacy_created,
+            ),
+        )
+        conn.commit()
+        conn.close()
+        arb.record_event("tick-legacy", session_id="sess-legacy")
+        legacy = arb.show_request("legacy-1")
+        legacy_events = [
+            row for row in rows(world, "events")
+            if row["event"] == "no_follow_through" and row["request_id"] == "legacy-1"
+        ]
+        suite.check(
+            "P1",
+            "legacy candidate with null expires is swept",
+            legacy["state"] == "EXPIRED"
+            and legacy["decision"] == "NO_FOLLOW_THROUGH"
+            and legacy_events
+            and '"from_state":"CANDIDATE"' in (legacy_events[-1]["detail_json"] or ""),
+            "state=%s decision=%s" % (legacy.get("state"), legacy.get("decision")),
+        )
+        pending = register("sess-judge", "judge-task")
+        promoted = arb.promote_pending(pending["request"]["request_id"]) if pending.get("ok") else None
+        pending_id = promoted["request_id"] if isinstance(promoted, dict) else ""
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE requests SET expires=? WHERE request_id=?", (time.time() - 5, pending_id))
+        conn.commit()
+        conn.close()
+        arb.record_event("tick-judge", session_id="sess-judge")
+        judged = arb.show_request(pending_id) or {}
+        suite.check(
+            "P1",
+            "judge pending expiry is no follow-through",
+            promoted and promoted.get("state") == "JUDGE_PENDING"
+            and judged.get("state") == "EXPIRED"
+            and judged.get("decision") == "NO_FOLLOW_THROUGH",
+            "promoted=%s judged=%s" % (
+                None if promoted is None else promoted.get("state"), judged.get("decision"),
+            ),
+        )
+        now = time.time()
+        conn = sqlite3.connect(db)
+        conn.execute(
+            """INSERT INTO requests (
+                   request_id, session_id, trigger, reason_code, state, decision, created, updated, expires
+               ) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                "grant-old", "sess-grant", "T02", "UNAPPROVED_OPUS", "GRANT_READY",
+                "ESCALATE", now, now, now - 5,
+            ),
+        )
+        conn.execute(
+            """INSERT INTO grants (grant_id, request_id, expires, uses_left)
+               VALUES ('g-ready', 'grant-old', ?, 1)""",
+            (now - 5,),
+        )
+        conn.commit()
+        conn.close()
+        arb.record_event("tick-grant", session_id="sess-grant")
+        ready = arb.show_request("grant-old") or {}
+        ready_grant = [row for row in rows(world, "grants") if row["grant_id"] == "g-ready"]
+        ready_event = [
+            row for row in rows(world, "events")
+            if row["event"] == "no_follow_through" and row["request_id"] == "grant-old"
+        ]
+        suite.check(
+            "P1",
+            "grant ready expiry keeps its decision and logs follow-through",
+            ready.get("state") == "EXPIRED"
+            and ready.get("decision") == "ESCALATE"
+            and ready_grant and ready_grant[0]["uses_left"] == 0
+            and ready_event
+            and '"from_state":"GRANT_READY"' in (ready_event[-1]["detail_json"] or ""),
+            "state=%s decision=%s grant=%s" % (
+                ready.get("state"), ready.get("decision"), ready_grant,
+            ),
+        )
+        replan = register("sess-replan", "replan-task")
+        replan_id = replan["request"]["request_id"]
+        arb.transition_to(replan_id, "REPLAN_PENDING")
+        resolved = arb.resolve_replan(replan_id, "because")
+        again = arb.resolve_replan(replan_id, "again")
+        replan_row = arb.show_request(replan_id) or {}
+        other = register("sess-other", "other-task")
+        other_id = other["request"]["request_id"]
+        refused = arb.resolve_replan(other_id, "no")
+        other_row = arb.show_request(other_id) or {}
+        suite.check(
+            "P1",
+            "resolve replan only moves REPLAN_PENDING",
+            replan["ok"] and resolved is True and again is False
+            and replan_row.get("state") == "REPLAN_RESOLVED"
+            and replan_row.get("decision") == "because"
+            and refused is False and other_row.get("state") == "CANDIDATE",
+            "resolved=%s again=%s state=%s other=%s" % (
+                resolved, again, replan_row.get("state"), other_row.get("state"),
+            ),
+        )
+        path = world.home / ".claude" / "hooks" / "data" / "opus-arbitration-policy.json"
+        original = path.read_text(encoding="utf-8")
+        data = json.loads(original)
+        data.pop("planning", None)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        loaded = arb.load_policy()
+        plain = arb.planning_config(loaded)
+        data["planning"] = "nope"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        raised = False
+        try:
+            malformed = arb.planning_config(arb.load_policy())
+        except Exception as exc:
+            raised = True
+            malformed = {"error": str(exc)}
+        data["planning"] = {"enabled": "yes", "max_steps": 4}
+        path.write_text(json.dumps(data), encoding="utf-8")
+        typed = arb.planning_config(arb.load_policy())
+        path.write_text(original, encoding="utf-8")
+        suite.check(
+            "P1",
+            "missing or malformed planning stays disabled",
+            loaded is not None and loaded.get("enabled") is True
+            and "planning" not in loaded
+            and plain["enabled"] is False and plain["max_steps"] == 12
+            and raised is False and malformed["enabled"] is False
+            and typed["enabled"] is False and typed["max_plan_versions_per_task"] == 3,
+            "plain=%s malformed=%s typed=%s" % (plain, malformed, typed),
+        )
+        import _router_plans as plans
+        body = {
+            "schema_version": 1,
+            "task_id": "status-task",
+            "base_plan_version": 0,
+            "objective": "Show the new status sections",
+            "assumptions": [],
+            "invariants": [],
+            "steps": [{
+                "id": "draft",
+                "depends_on": [],
+                "executor_role": "main",
+                "allowed_model": "main",
+                "instructions": "Record the stage",
+                "acceptance_checks": ["The stage is open"],
+                "requires_user_approval": False,
+            }],
+            "risks": [],
+            "handoff_notes": "",
+        }
+        record = plans.promote("status-task", body)
+        arb.record_plan_version(
+            "sess-status", "status-task", record["version"],
+            record["content_sha256"], record["scope_digest"],
+        )
+        started, _code, _attempt = arb.stage_start("sess-status", "status-task", record["version"], "draft")
+        status = subprocess.run(
+            [sys.executable, str(CLI), "status"],
+            capture_output=True, text=True, env=world.env(), timeout=15, check=False,
+        )
+        suite.check(
+            "P1",
+            "status shows unresolved follow-through and open stages",
+            started and status.returncode == 0
+            and "unresolved (no follow-through, 7d):" in status.stdout
+            and "stages open:" in status.stdout
+            and request_id in status.stdout
+            and "from_state=CANDIDATE" in status.stdout
+            and "stage=draft" in status.stdout,
+            status.stdout[-500:],
+        )
+        cancel = register("sess-cancel", "cancel-task")
+        cancel_id = cancel["request"]["request_id"]
+        arb.transition_to(cancel_id, "REPLAN_PENDING")
+        arb.disable_arbitration()
+        cancelled = arb.show_request(cancel_id) or {}
+        suite.check(
+            "P1",
+            "disable cancels REPLAN_PENDING",
+            cancel["ok"] and cancelled.get("state") == "CANCELLED",
+            cancelled.get("state"),
+        )
+    finally:
+        world.close()
+
+
+def _enable_planning(world):
+    path = world.home / ".claude" / "hooks" / "data" / "opus-arbitration-policy.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["planning"]["enabled"] = True
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _planner_file(world, model="opus", tools="tools: []\n"):
+    _agent_md(world.home / ".claude" / "agents" / "opus-planner.md", model, tools)
+
+
+def _planner_call(world, **kwargs):
+    kwargs.setdefault("subagent_type", "opus-planner")
+    kwargs.setdefault("model", "opus")
+    kwargs.setdefault("description", "Plan the work")
+    kwargs.setdefault("prompt", "ROUTER-TASK plan-1\nPlan the store")
+    return agent_payload(world, **kwargs)
+
+
+def _grant_uses(world, request_id):
+    for row in rows(world, "grants"):
+        if row.get("request_id") == request_id:
+            return row.get("uses_left")
+    return None
+
+
+def test_planner(suite):
+    judge_text = (ROOT.parent / "agents" / "opus-judge.md").read_text(encoding="utf-8")
+    suite.check(
+        "P11",
+        "judge instructions keep the nine keys and the planner sentence",
+        all(key in judge_text for key in (
+            '"schema_version":1', '"request_id":', '"decision":', '"recommended_model":',
+            '"reason_code":', '"rationale":', '"evidence_used":', '"execution_scope":',
+            '"suggested_next_step":',
+        ))
+        and "For PLAN_REQUEST and REPLAN_REQUEST, ESCALATE authorizes only one analysis-only planner call; choose CONTINUE when Sonnet-level planning is enough." in judge_text,
+        "",
+    )
+    world = World()
+    try:
+        before = rows(world, "requests")
+        kind, reason = verdict(run_gate(world, _planner_call(
+            world, session_id="sess-p1", tool_use_id="p1",
+        )))
+        suite.check(
+            "P1",
+            "disabled planning denies and creates no request",
+            kind == "deny" and reason == "OPUS_PLANNER_DISABLED" and rows(world, "requests") == before,
+            reason[:200],
+        )
+        _enable_planning(world)
+        _planner_file(world)
+        kind, reason = verdict(run_gate(world, _planner_call(
+            world, session_id="sess-p2", tool_use_id="p2", transcript=world.opus_transcript,
+        )))
+        suite.check(
+            "P2",
+            "an Opus main session is told to plan itself",
+            kind == "deny"
+            and reason.startswith("OPUS_PLANNER_NOT_NEEDED ")
+            and "write the plan yourself" in reason
+            and not any(row["session_id"] == "sess-p2" for row in rows(world, "requests")),
+            reason[:240],
+        )
+        kind, reason = verdict(run_gate(world, _planner_call(
+            world, session_id="sess-p2b", tool_use_id="p2b", model="inherit",
+            transcript=world.opus_transcript,
+        )))
+        suite.check(
+            "P2b",
+            "inherit on an Opus main does not need the planner",
+            kind == "deny" and reason.startswith("OPUS_PLANNER_NOT_NEEDED ")
+            and not any(row["session_id"] == "sess-p2b" for row in rows(world, "requests")),
+            reason[:240],
+        )
+        kind, reason = verdict(run_gate(world, _planner_call(
+            world, session_id="sess-p3", tool_use_id="p3", prompt="ROUTER-TASK plan-1\nPlan the store",
+        )))
+        request_id, packet = pending_from_deny(reason)
+        stored = [row for row in rows(world, "requests") if row.get("request_id") == request_id]
+        suite.check(
+            "P3",
+            "a Sonnet main session opens a plan request",
+            kind == "deny" and "ARBITRATION_REQUIRED" in reason
+            and stored and stored[0].get("candidate_type") == "PLAN_REQUEST"
+            and stored[0].get("plan_task_id") == "plan-1",
+            "kind=%s type=%s task=%s" % (
+                kind,
+                None if not stored else stored[0].get("candidate_type"),
+                None if not stored else stored[0].get("plan_task_id"),
+            ),
+        )
+        suite.check(
+            "P11",
+            "a plan packet names the candidate and the capability",
+            isinstance(packet, str)
+            and "candidate_type: PLAN_REQUEST" in packet
+            and "requested_capability: PLAN_ONLY" in packet
+            and isinstance(packet_object(packet), dict),
+            (packet or "")[:300],
+        )
+        counted = len(rows(world, "requests"))
+        kind, reason = verdict(run_gate(world, _planner_call(
+            world, session_id="sess-sonnet", tool_use_id="p3-sonnet", model="sonnet",
+        )))
+        suite.check(
+            "P3",
+            "a per-call sonnet planner is not Opus",
+            kind == "allow" and len(rows(world, "requests")) == counted,
+            "kind=%s reason=%s" % (kind, reason[:160]),
+        )
+        exec_kind, exec_reason = verdict(run_gate(world, agent_payload(
+            world, model="opus", session_id="sess-exec", tool_use_id="p-exec",
+            description="Do the work", prompt="do the work",
+        )))
+        _exec_id, exec_packet = pending_from_deny(exec_reason)
+        suite.check(
+            "P11",
+            "an executor packet stays an executor escalation",
+            exec_kind == "deny" and isinstance(exec_packet, str)
+            and "candidate_type: EXECUTOR_ESCALATION" in exec_packet
+            and "requested_capability: EXECUTOR" in exec_packet,
+            (exec_packet or exec_reason)[:300],
+        )
+        for decision in ("CONTINUE", "RETRY", "STOP"):
+            payload = _planner_call(
+                world, session_id="sess-" + decision.lower(), tool_use_id="open-" + decision,
+                prompt="ROUTER-TASK " + decision.lower() + "\nPlan " + decision,
+                description="Plan " + decision,
+            )
+            denied = run_gate(world, payload)
+            _kind, denied_reason = verdict(denied)
+            decided_id, decided_packet = pending_from_deny(denied_reason)
+            run_gate(world, judge_payload(world, decided_packet, payload["session_id"], "judge-" + decision))
+            arb.ingest_judge_result(judge_result(
+                world, decided_id, "judge-" + decision, decision, session_id=payload["session_id"],
+            ))
+            again_kind, again_reason = verdict(run_gate(world, {**payload, "tool_use_id": "again-" + decision}))
+            suite.check(
+                "P4",
+                "%s leaves no grant and blocks a retry" % decision,
+                again_kind == "deny" and again_reason.startswith("ARBITRATION_ALREADY_DECIDED")
+                and _grant_uses(world, decided_id) is None,
+                again_reason[:200],
+            )
+        granted = _planner_call(
+            world, session_id="sess-grant", tool_use_id="grant-open",
+            prompt="ROUTER-TASK granted\nPlan the granted work", description="Plan the granted work",
+        )
+        granted, grant_id, grant_result = escalate(world, granted)
+        grant_rows = [row for row in rows(world, "grants") if row.get("request_id") == grant_id]
+        mismatch = agent_payload(
+            world, model="opus", session_id="sess-grant", tool_use_id="grant-mismatch",
+            subagent_type="general-purpose", description="Plan the granted work",
+            prompt="ROUTER-TASK granted\nPlan the granted work",
+        )
+        mismatch_kind, mismatch_reason = verdict(run_gate(world, mismatch))
+        suite.check(
+            "P6",
+            "a planner grant cannot run general-purpose",
+            grant_result.get("decision") == "ESCALATE"
+            and grant_rows and grant_rows[0].get("purpose") == "PLAN_ONLY"
+            and mismatch_kind == "deny" and mismatch_reason == "GRANT_PURPOSE_MISMATCH"
+            and _grant_uses(world, grant_id) == 1,
+            "decision=%s reason=%s uses=%s" % (grant_result.get("decision"), mismatch_reason, _grant_uses(world, grant_id)),
+        )
+        reference = agent_payload(
+            world, model="opus", session_id="sess-grant", tool_use_id="grant-ref-purpose",
+            subagent_type="general-purpose", description="Plan the granted work",
+            prompt="ARBITRATION-GRANT request_id=%s" % grant_id,
+        )
+        ref_kind, ref_reason = verdict(run_gate(world, reference))
+        suite.check(
+            "P6b",
+            "a grant reference from a non-planner does not consume a plan grant",
+            ref_kind == "deny" and ref_reason == "GRANT_PURPOSE_MISMATCH"
+            and _grant_uses(world, grant_id) == 1,
+            "reason=%s uses=%s" % (ref_reason, _grant_uses(world, grant_id)),
+        )
+        used = run_gate(world, {**granted, "tool_use_id": "grant-use"})
+        used_kind, used_reason = verdict(used)
+        second_kind, second_reason = verdict(run_gate(world, {**granted, "tool_use_id": "grant-use-2"}))
+        suite.check(
+            "P5",
+            "the planner grant allows one identical call",
+            used_kind == "allow" and used.stdout == ""
+            and second_kind == "deny" and _grant_uses(world, grant_id) == 0,
+            "used=%s %s second=%s %s" % (used_kind, used_reason[:80], second_kind, second_reason[:80]),
+        )
+        fresh = _planner_call(
+            world, session_id="sess-mutate", tool_use_id="mutate-open",
+            prompt="ROUTER-TASK mutate\nPlan the mutable work", description="Plan the mutable work",
+        )
+        fresh, fresh_id, _fresh_result = escalate(world, fresh)
+        prompt_kind, prompt_reason = verdict(run_gate(world, {
+            **fresh, "tool_use_id": "mutate-prompt",
+            "tool_input": {**fresh["tool_input"], "prompt": "ROUTER-TASK mutate\nA different plan"},
+        }))
+        desc_kind, desc_reason = verdict(run_gate(world, {
+            **fresh, "tool_use_id": "mutate-desc",
+            "tool_input": {**fresh["tool_input"], "description": "A different description"},
+        }))
+        bg_kind, bg_reason = verdict(run_gate(world, {
+            **fresh, "tool_use_id": "mutate-bg",
+            "tool_input": {**fresh["tool_input"], "run_in_background": True},
+        }))
+        suite.check(
+            "P7",
+            "a changed planner call does not consume the grant",
+            prompt_kind == "deny" and desc_kind == "deny"
+            and bg_kind == "deny" and bg_reason == "OPUS_BACKGROUND_DENIED"
+            and _grant_uses(world, fresh_id) == 1,
+            "prompt=%s desc=%s bg=%s uses=%s" % (prompt_reason[:80], desc_reason[:80], bg_reason, _grant_uses(world, fresh_id)),
+        )
+        strict_kind, strict_reason = verdict(run_gate(
+            world,
+            _planner_call(world, session_id="sess-strict", tool_use_id="strict-1"),
+            {"CLAUDE_ROUTING_MODE": "strict"},
+        ))
+        suite.check(
+            "P8",
+            "strict mode denies the planner before planning",
+            strict_kind == "deny" and strict_reason == "OPUS_DENIED mode=strict; use sonnet/haiku"
+            and not any(row["session_id"] == "sess-strict" for row in rows(world, "requests")),
+            strict_reason,
+        )
+        pending = _planner_call(world, session_id="sess-disable", tool_use_id="disable-1")
+        pending_kind, pending_reason = verdict(run_gate(world, pending))
+        pending_id = request_id_from_text(pending_reason)
+        arb.disable_arbitration()
+        shown = arb.show_request(pending_id)
+        off_kind, off_reason = verdict(run_gate(world, {**pending, "tool_use_id": "disable-2"}))
+        suite.check(
+            "P8",
+            "disable cancels a pending plan request",
+            pending_kind == "deny" and "ARBITRATION_REQUIRED" in pending_reason
+            and isinstance(shown, dict) and shown.get("state") == "CANCELLED"
+            and off_kind == "deny" and off_reason == "OPUS_DENIED mode=disabled",
+            "state=%s off=%s" % (None if not isinstance(shown, dict) else shown.get("state"), off_reason),
+        )
+    finally:
+        world.close()
+
+    broken = World()
+    try:
+        _enable_planning(broken)
+        _planner_file(broken, tools="tools: [Read]\n")
+        kind, reason = verdict(run_gate(broken, _planner_call(
+            broken, session_id="sess-tools", tool_use_id="bad-tools",
+        )))
+        suite.check("P9", "non-empty tools are an invalid planner", kind == "deny" and reason == "PLANNER_DEFINITION_INVALID", reason)
+        _planner_file(broken, model="haiku")
+        kind, reason = verdict(run_gate(broken, _planner_call(
+            broken, session_id="sess-model", tool_use_id="bad-model",
+        )))
+        suite.check("P9", "a non-opus planner model is invalid", kind == "deny" and reason == "PLANNER_DEFINITION_INVALID", reason)
+        _planner_file(broken)
+        project_agent = broken.project / ".claude" / "agents" / "opus-planner.md"
+        _agent_md(project_agent, "opus", "tools: []\n")
+        kind, reason = verdict(run_gate(broken, _planner_call(
+            broken, session_id="sess-shadow", tool_use_id="shadow-project",
+        )))
+        suite.check("P9", "a project planner shadows the user file", kind == "deny" and reason == "PLANNER_SHADOWED", reason)
+        project_agent.unlink()
+        plugin_agent = broken.home / ".claude" / "plugins" / "opusplug" / "agents" / "opus-planner.md"
+        _agent_md(plugin_agent, "opus", "tools: []\n")
+        kind, reason = verdict(run_gate(broken, _planner_call(
+            broken, session_id="sess-plugin", tool_use_id="shadow-plugin",
+        )))
+        suite.check("P9", "a plugin planner shadows the user file", kind == "deny" and reason == "PLANNER_SHADOWED", reason)
+    finally:
+        broken.close()
+
+
+def _plan_body(task_id, base_version=0, steps=None):
+    if steps is None:
+        steps = ("draft", "review")
+    body_steps = []
+    for index, step_id in enumerate(steps):
+        body_steps.append({
+            "id": step_id,
+            "depends_on": [] if index == 0 else [steps[index - 1]],
+            "executor_role": "main",
+            "allowed_model": "main",
+            "instructions": "Carry the stage",
+            "acceptance_checks": ["The stage is recorded"],
+            "requires_user_approval": False,
+        })
+    return {
+        "schema_version": 1,
+        "task_id": task_id,
+        "base_plan_version": base_version,
+        "objective": "Revise the stage when the checkpoint is wrong",
+        "assumptions": ["The ledger is local"],
+        "invariants": ["Plans are data"],
+        "steps": body_steps,
+        "risks": [],
+        "handoff_notes": "",
+    }
+
+
+def _publish_plan(session_id, task_id, base_version=0, steps=None):
+    import _router_plans as plans
+
+    record = plans.promote(task_id, _plan_body(task_id, base_version, steps))
+    arb.record_plan_version(
+        session_id, task_id, record["version"], record["content_sha256"], record["scope_digest"],
+    )
+    return record
+
+
+def _reserve_worker(world, session_id, task_id, version, stage_id, tool_use_id, prompt_id, agent_id):
+    accepted = arb.accept_workflow({
+        "tool_use_id": tool_use_id,
+        "session_id": session_id,
+        "prompt_id": prompt_id,
+        "cwd": str(world.project),
+    }, "sonnet")
+    ok, code, _attempt = arb.stage_start(
+        session_id, task_id, version, stage_id, workflow_tool_use_id=tool_use_id,
+    )
+    recorded = arb.record_workflow_worker({
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "prompt_id": prompt_id,
+        "cwd": str(world.project),
+    })
+    return accepted and ok and code == "OK" and isinstance(recorded, dict)
+
+
+def _replan_footer(task_id, stage_id, version, **extra):
+    body = {
+        "schema_version": 2,
+        "task_id": task_id,
+        "status": "NEEDS_JUDGMENT",
+        "reason_code": "PLAN_REVISION_REQUIRED",
+        "evidence_refs": ["notes/evidence.md"],
+        "stage_id": stage_id,
+        "plan_version": version,
+        "unresolved_question": "Which file owns the stage?",
+        "requested_action": "REPLAN",
+        "failed_requirement_ids": ["req-1"],
+        "completed_stage_ids": [],
+    }
+    body.update(extra)
+    return body
+
+
+def _run_guard(world, payload):
+    return subprocess.run(
+        [sys.executable, str(ROOT / "opus-workflow-guard.py")],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        env=world.env(),
+        cwd=str(world.project),
+        timeout=30,
+        check=False,
+    )
+
+
+def _worker_stop(world, session_id, agent_id, footer, transcript):
+    stop = json.loads(
+        (FIXTURES / "workflow" / "20261105T043812.562702Z-SubagentStop-none.json").read_text(encoding="utf-8")
+    )
+    stop["session_id"] = session_id
+    stop["cwd"] = str(world.project)
+    stop["transcript_path"] = str(transcript)
+    stop["agent_id"] = agent_id
+    stop["agent_type"] = "workflow-subagent"
+    stop["last_assistant_message"] = json.dumps(footer)
+    stop.pop("agent_transcript_path", None)
+    return _run_guard(world, stop)
+
+
+def _main_pretool(world, session_id, tool_use_id):
+    return _run_guard(world, {
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Read",
+        "session_id": session_id,
+        "cwd": str(world.project),
+        "tool_use_id": tool_use_id,
+        "tool_input": {"file_path": "/tmp/readme"},
+    })
+
+
+def _stage_rows(world, task_id, stage_id=None):
+    found = [row for row in rows(world, "stages") if row.get("task_id") == task_id]
+    if stage_id is None:
+        return found
+    return [row for row in found if row.get("stage_id") == stage_id]
+
+
+def _set_planning(world, enabled=True, replans=None, judgments=None):
+    path = world.home / ".claude" / "hooks" / "data" / "opus-arbitration-policy.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["planning"]["enabled"] = enabled
+    if replans is not None:
+        data["planning"]["max_replans_per_task"] = replans
+    if judgments is not None:
+        data["limits"]["max_judgments_per_session"] = judgments
+        data["limits"]["max_judgments_per_task"] = judgments
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def test_replan(suite):
+    v1 = {
+        "schema_version": 1,
+        "task_id": "footer-task",
+        "status": "NEEDS_JUDGMENT",
+        "reason_code": "WORKER_REQUEST",
+        "unresolved": ["one"],
+        "evidence_refs": ["a.md"],
+    }
+    parsed_v1 = triggers.parse_footer("noise\n" + json.dumps(v1))
+    v2 = _replan_footer("footer-task", "draft", 1, plan_id="plan-1", workflow_run_id="run-1")
+    parsed_v2 = triggers.parse_footer(json.dumps(v2))
+    unknown = dict(v2)
+    unknown["extra"] = "no"
+    boolean = dict(v2)
+    boolean["plan_version"] = True
+    suite.check(
+        "R1",
+        "v1 stays identical, v2 parses, and a bad v2 is rejected",
+        parsed_v1 == v1
+        and parsed_v2 == v2
+        and triggers.parse_footer(json.dumps(unknown)) is None
+        and triggers.parse_footer(json.dumps(boolean)) is None,
+        "v1=%s v2=%s" % (parsed_v1, None if parsed_v2 is None else parsed_v2.get("schema_version")),
+    )
+
+    world = World()
+    try:
+        _set_planning(world, True, judgments=1)
+        _planner_file(world)
+        task_id = "replan-task"
+        session_id = "sess-replan"
+        record = _publish_plan(session_id, task_id)
+        version = record["version"]
+        agent_id = "a" + "b" * 16
+        ready = _reserve_worker(
+            world, session_id, task_id, version, "draft", "wf-replan", "prompt-replan", agent_id,
+        )
+        stopped = _worker_stop(
+            world, session_id, agent_id,
+            _replan_footer(task_id, "draft", version),
+            world.opus_transcript,
+        )
+        replans = [
+            row for row in rows(world, "requests")
+            if row.get("candidate_type") == "REPLAN_REQUEST" and row.get("plan_task_id") == task_id
+        ]
+        stage = _stage_rows(world, task_id, "draft")
+        events = (world.home / ".claude" / "logs" / "opus-arbitration" / "events.jsonl").read_text(encoding="utf-8")
+        first = _main_pretool(world, session_id, "main-r2")
+        text = (hook_body(first) or {}).get("additionalContext") or ""
+        second = _main_pretool(world, session_id, "main-r2b")
+        later = arb.register_candidate(
+            session_id=session_id, task_id="other-quota", trigger="T02", reason_code="UNAPPROVED_OPUS",
+        )
+        suite.check(
+            "R2",
+            "an Opus main replan is pending without a judge and surfaces once",
+            ready and stopped.returncode == 0
+            and len(replans) == 1
+            and replans[0]["state"] == "REPLAN_PENDING"
+            and replans[0]["candidate_type"] == "REPLAN_REQUEST"
+            and not replans[0].get("packet_text")
+            and "judge_pending" not in events
+            and stage and stage[0]["status"] == "needs_judgment"
+            and text.startswith("REPLAN_REQUIRED request_id=%s" % replans[0]["request_id"])
+            and "task=%s" % task_id in text
+            and "plan_version=%s" % version in text
+            and "stage=draft" in text
+            and second.stdout == ""
+            and later.get("ok") is True,
+            "text=%s later=%s state=%s" % (
+                text[:240], later.get("reason"), None if not replans else replans[0]["state"],
+            ),
+        )
+
+        other_agent = "a" + "c" * 16
+        linked = arb.record_workflow_worker({
+            "agent_id": other_agent,
+            "session_id": session_id,
+            "prompt_id": "prompt-replan",
+            "cwd": str(world.project),
+        })
+        again = _worker_stop(
+            world, session_id, other_agent,
+            _replan_footer(task_id, "draft", version),
+            world.opus_transcript,
+        )
+        same = [
+            row for row in rows(world, "requests")
+            if row.get("candidate_type") == "REPLAN_REQUEST" and row.get("plan_task_id") == task_id
+        ]
+        deduped = (world.home / ".claude" / "logs" / "opus-arbitration" / "events.jsonl").read_text(encoding="utf-8")
+        suite.check(
+            "R3",
+            "two workers in one stage share one replan",
+            isinstance(linked, dict) and again.returncode == 0 and len(same) == 1
+            and "candidate_deduped" in deduped,
+            "rows=%s" % len(same),
+        )
+
+        _set_planning(world, True, judgments=3)
+        bare = "a" + "d" * 16
+        arb.record_workflow_worker({
+            "agent_id": bare,
+            "session_id": session_id,
+            "prompt_id": "missing-prompt",
+            "cwd": str(world.project),
+        })
+        mismatch_footer = _replan_footer(task_id, "review", version, unresolved=["the mismatch"])
+        _worker_stop(world, session_id, agent_id, mismatch_footer, world.opus_transcript)
+        _worker_stop(
+            world, session_id, bare,
+            _replan_footer(task_id, "draft", version, unresolved=["no stage"]),
+            world.opus_transcript,
+        )
+        kinds = [
+            row.get("candidate_type") for row in rows(world, "requests")
+            if row.get("session_id") == session_id
+        ]
+        uncorrelated = (world.home / ".claude" / "logs" / "opus-arbitration" / "events.jsonl").read_text(encoding="utf-8")
+        suite.check(
+            "R4",
+            "an unmatched footer stays on the generic path",
+            uncorrelated.count("replan_uncorrelated") >= 2
+            and kinds.count("REPLAN_REQUEST") == 1
+            and "EXECUTOR_ESCALATION" in kinds,
+            "kinds=%s" % kinds,
+        )
+    finally:
+        world.close()
+
+    limited = World()
+    try:
+        _set_planning(limited, False)
+        task_id = "limit-task"
+        session_id = "sess-limit"
+        record = _publish_plan(session_id, task_id, steps=("draft", "review", "notes"))
+        version = record["version"]
+        agent_id = "a" + "e" * 16
+        _reserve_worker(limited, session_id, task_id, version, "draft", "wf-off", "prompt-off", agent_id)
+        _worker_stop(
+            limited, session_id, agent_id,
+            _replan_footer(task_id, "draft", version),
+            limited.opus_transcript,
+        )
+        blocked = _main_pretool(limited, session_id, "main-off")
+        blocked_text = (hook_body(blocked) or {}).get("additionalContext") or ""
+        suite.check(
+            "R5",
+            "disabled planning surfaces REPLAN_BLOCKED and creates nothing",
+            not any(row.get("candidate_type") == "REPLAN_REQUEST" for row in rows(limited, "requests"))
+            and "REPLAN_BLOCKED task=%s stage=draft reason=planning_disabled" % task_id in blocked_text
+            and _stage_rows(limited, task_id, "draft")[0]["status"] == "needs_judgment",
+            blocked_text[:240],
+        )
+        _set_planning(limited, True, replans=1)
+        review_agent = "a" + "f" * 16
+        review_ready = _reserve_worker(
+            limited, session_id, task_id, version, "review", "wf-cap", "prompt-cap", review_agent,
+        )
+        _worker_stop(
+            limited, session_id, review_agent,
+            _replan_footer(task_id, "review", version),
+            limited.opus_transcript,
+        )
+        notes_agent = "a" + "9" * 16
+        notes_ready = _reserve_worker(
+            limited, session_id, task_id, version, "notes", "wf-notes", "prompt-notes", notes_agent,
+        )
+        _worker_stop(
+            limited, session_id, notes_agent,
+            _replan_footer(task_id, "notes", version),
+            limited.opus_transcript,
+        )
+        capped = [
+            row for row in rows(limited, "requests")
+            if row.get("candidate_type") == "REPLAN_REQUEST" and row.get("plan_task_id") == task_id
+        ]
+        cap_text = (hook_body(_main_pretool(limited, session_id, "main-cap")) or {}).get("additionalContext") or ""
+        suite.check(
+            "R5",
+            "the replan cap surfaces REPLAN_BLOCKED and creates no further request",
+            review_ready and notes_ready and len(capped) == 1
+            and "REPLAN_BLOCKED task=%s stage=notes reason=replan_limit" % task_id in cap_text
+            and _stage_rows(limited, task_id, "notes")[0]["status"] == "needs_judgment",
+            "rows=%s text=%s" % (len(capped), cap_text[:240]),
+        )
+    finally:
+        limited.close()
+
+    sonnet = World()
+    try:
+        _set_planning(sonnet, True)
+        _planner_file(sonnet)
+        session_id = "sess-sonnet"
+        esc_task = "sonnet-esc"
+        cont_task = "sonnet-cont"
+        esc_version = _publish_plan(session_id, esc_task)["version"]
+        cont_version = _publish_plan(session_id, cont_task)["version"]
+        esc_agent = "a" + "1" * 16
+        cont_agent = "a" + "2" * 16
+        _reserve_worker(sonnet, session_id, esc_task, esc_version, "draft", "wf-esc", "prompt-esc", esc_agent)
+        _reserve_worker(sonnet, session_id, cont_task, cont_version, "draft", "wf-cont", "prompt-cont", cont_agent)
+        _worker_stop(sonnet, session_id, esc_agent, _replan_footer(esc_task, "draft", esc_version), sonnet.sonnet_transcript)
+        _worker_stop(sonnet, session_id, cont_agent, _replan_footer(cont_task, "draft", cont_version), sonnet.sonnet_transcript)
+        esc_row = next(
+            row for row in rows(sonnet, "requests")
+            if row.get("plan_task_id") == esc_task and row.get("candidate_type") == "REPLAN_REQUEST"
+        )
+        cont_row = next(
+            row for row in rows(sonnet, "requests")
+            if row.get("plan_task_id") == cont_task and row.get("candidate_type") == "REPLAN_REQUEST"
+        )
+        esc_packet = stored_packet(esc_row["request_id"])
+        launched = run_gate(sonnet, judge_payload(sonnet, esc_packet, session_id, "judge-" + esc_row["request_id"]))
+        launch_kind, launch_reason = verdict(launched)
+        escalated = arb.ingest_judge_result(judge_result(
+            sonnet, esc_row["request_id"], "judge-" + esc_row["request_id"], "ESCALATE", session_id=session_id,
+        ))
+        worker = escalated.get("worker_invocation") or {}
+        grant_rows = [row for row in rows(sonnet, "grants") if row.get("request_id") == esc_row["request_id"]]
+        reference = agent_payload(
+            sonnet, model="opus", session_id=session_id, tool_use_id="replan-ref",
+            subagent_type="general-purpose", description=worker.get("description"),
+            prompt="ARBITRATION-GRANT request_id=%s" % esc_row["request_id"],
+            transcript=sonnet.sonnet_transcript,
+        )
+        ref_kind, ref_reason = verdict(run_gate(sonnet, reference))
+        exact = agent_payload(
+            sonnet, session_id=session_id, tool_use_id="replan-use",
+            subagent_type=worker.get("subagent_type"), model=worker.get("model"),
+            description=worker.get("description"), prompt=worker.get("prompt"),
+            run_in_background=False, transcript=sonnet.sonnet_transcript,
+        )
+        used_kind, used_reason = verdict(run_gate(sonnet, exact))
+        again_kind, again_reason = verdict(run_gate(sonnet, {**exact, "tool_use_id": "replan-use-2"}))
+        cont_packet = stored_packet(cont_row["request_id"])
+        run_gate(sonnet, judge_payload(sonnet, cont_packet, session_id, "judge-" + cont_row["request_id"]))
+        continued = arb.ingest_judge_result(judge_result(
+            sonnet, cont_row["request_id"], "judge-" + cont_row["request_id"], "CONTINUE", session_id=session_id,
+        ))
+        suite.check(
+            "R6",
+            "a Sonnet main replan is judged and one planner call consumes the grant",
+            esc_row["state"] == "JUDGE_PENDING"
+            and "candidate_type: REPLAN_REQUEST" in (esc_packet or "")
+            and launch_kind == "allow"
+            and escalated.get("decision") == "ESCALATE"
+            and worker.get("subagent_type") == "opus-planner"
+            and worker.get("model") == "opus"
+            and isinstance(worker.get("prompt"), str)
+            and worker["prompt"].startswith("ROUTER-TASK %s" % esc_task)
+            and grant_rows and grant_rows[0].get("purpose") == "PLAN_ONLY"
+            and ref_kind == "deny" and ref_reason == "GRANT_PURPOSE_MISMATCH"
+            and used_kind == "allow"
+            and again_kind == "deny"
+            and continued.get("decision") == "CONTINUE"
+            and _grant_uses(sonnet, cont_row["request_id"]) is None,
+            "launch=%s %s ref=%s used=%s %s again=%s %s worker=%s" % (
+                launch_kind, launch_reason[:120], ref_reason, used_kind, used_reason[:120],
+                again_kind, again_reason[:80], worker.get("subagent_type"),
+            ),
+        )
+    finally:
+        sonnet.close()
+
+    strict_world = World()
+    try:
+        _set_planning(strict_world, True)
+        _planner_file(strict_world)
+        session_id = "sess-strict-replan"
+        task_id = "strict-task"
+        version = _publish_plan(session_id, task_id)["version"]
+        agent_id = "a" + "7" * 16
+        _reserve_worker(strict_world, session_id, task_id, version, "draft", "wf-strict", "prompt-strict", agent_id)
+        _worker_stop(
+            strict_world, session_id, agent_id,
+            _replan_footer(task_id, "draft", version),
+            strict_world.sonnet_transcript,
+        )
+        row = next(item for item in rows(strict_world, "requests") if item.get("plan_task_id") == task_id)
+        packet = stored_packet(row["request_id"])
+        run_gate(strict_world, judge_payload(strict_world, packet, session_id, "judge-" + row["request_id"]))
+        result = arb.ingest_judge_result(judge_result(
+            strict_world, row["request_id"], "judge-" + row["request_id"], "ESCALATE", session_id=session_id,
+        ))
+        worker = result.get("worker_invocation") or {}
+        denied_kind, denied_reason = verdict(run_gate(
+            strict_world,
+            agent_payload(
+                strict_world, session_id=session_id, tool_use_id="strict-planner",
+                subagent_type=worker.get("subagent_type"), model=worker.get("model"),
+                description=worker.get("description"), prompt=worker.get("prompt"),
+                transcript=strict_world.sonnet_transcript,
+            ),
+            {"CLAUDE_ROUTING_MODE": "strict"},
+        ))
+        suite.check(
+            "R12",
+            "strict mode keeps the replan and denies the planner",
+            row["candidate_type"] == "REPLAN_REQUEST"
+            and row["state"] == "JUDGE_PENDING"
+            and result.get("decision") == "ESCALATE"
+            and denied_kind == "deny"
+            and denied_reason == "OPUS_DENIED mode=strict; use sonnet/haiku"
+            and _grant_uses(strict_world, row["request_id"]) == 1,
+            "reason=%s uses=%s" % (denied_reason, _grant_uses(strict_world, row["request_id"])),
+        )
+    finally:
+        strict_world.close()
+
+    promoted = World()
+    try:
+        _set_planning(promoted, True)
+        task_id = "promote-task"
+        session_id = "sess-promote"
+        version = _publish_plan(session_id, task_id)["version"]
+        first_agent = "a" + "a" * 16
+        second_agent = "a" + "b" * 16
+        _reserve_worker(promoted, session_id, task_id, version, "draft", "wf-p1", "prompt-p1", first_agent)
+        _reserve_worker(promoted, session_id, task_id, version, "review", "wf-p2", "prompt-p2", second_agent)
+        _worker_stop(promoted, session_id, first_agent, _replan_footer(task_id, "draft", version), promoted.opus_transcript)
+        _worker_stop(promoted, session_id, second_agent, _replan_footer(task_id, "review", version), promoted.opus_transcript)
+        open_rows = [
+            row for row in rows(promoted, "requests")
+            if row.get("plan_task_id") == task_id and row.get("state") == "REPLAN_PENDING"
+        ]
+        named = next(row for row in open_rows if "draft" in (row.get("context_json") or ""))
+        other = next(row for row in open_rows if row["request_id"] != named["request_id"])
+        drafts = promoted.home / ".claude" / "plans" / "router" / "drafts"
+        drafts.mkdir(parents=True, exist_ok=True)
+        draft_path = drafts / ("%s.json" % task_id)
+        draft_path.write_text(json.dumps(_plan_body(task_id, version, ("fresh",))), encoding="utf-8")
+        cli = subprocess.run(
+            [sys.executable, str(ROOT / "bin" / "router-plan"), "promote", task_id, str(draft_path), "--resolves", named["request_id"]],
+            text=True, capture_output=True, env=promoted.env(), cwd=str(promoted.project), timeout=30, check=False,
+        )
+        after = {row["request_id"]: row for row in rows(promoted, "requests") if row.get("plan_task_id") == task_id}
+        dup_ok, dup_code, _dup = arb.stage_start(session_id, task_id, version, "draft")
+        pinned = {
+            "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": "sonnet",
+            "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS": "4",
+        }
+        fresh_id = "wf-fresh"
+        _plant_workflow_runtime(promoted, session_id, fresh_id)
+        fresh = _workflow_call(promoted, "log('fresh')", promoted.opus_transcript, session_id, fresh_id)
+        fresh["tool_input"]["args"] = {"router_stage": {"task_id": task_id, "plan_version": version + 1, "stage_id": "fresh"}}
+        fresh_kind, fresh_reason = verdict(run_gate(promoted, fresh, pinned))
+        fresh_rows = _stage_rows(promoted, task_id, "fresh")
+        old_rows = _stage_rows(promoted, task_id, "draft")
+        resume_id = "wf-resume"
+        _plant_workflow_runtime(promoted, session_id, resume_id)
+        resume = _workflow_call(promoted, "log('fresh')", promoted.opus_transcript, session_id, resume_id)
+        resume["tool_input"]["resumeFromRunId"] = "run-old"
+        resume["tool_input"]["args"] = {
+            "router_stage": {"task_id": task_id, "plan_version": version + 1, "stage_id": "other"},
+        }
+        resume_kind, resume_reason = verdict(run_gate(promoted, resume, pinned))
+        suite.check(
+            "R7",
+            "promote resolves the named replan and supersedes the other",
+            cli.returncode == 0 and len(open_rows) == 2
+            and after[named["request_id"]]["state"] == "REPLAN_RESOLVED"
+            and after[named["request_id"]]["decision"] == "PLAN_PROMOTED"
+            and after[other["request_id"]]["state"] == "REPLAN_RESOLVED"
+            and after[other["request_id"]]["decision"] == "superseded_by_v%s" % (version + 1),
+            "code=%s stdout=%s stderr=%s" % (cli.returncode, cli.stdout[-300:], cli.stderr[-200:]),
+        )
+        suite.check(
+            "R9",
+            "a yielded stage stays put and the new version can start",
+            dup_ok is False and dup_code == "ROUTER_STAGE_DUPLICATE"
+            and old_rows and old_rows[0]["status"] == "needs_judgment"
+            and fresh_kind == "allow"
+            and fresh_rows and fresh_rows[0]["status"] == "started"
+            and fresh_rows[0]["plan_version"] == version + 1
+            and resume_kind == "deny" and "resumeFromRunId" in resume_reason
+            and not _stage_rows(promoted, task_id, "other"),
+            "dup=%s fresh=%s %s resume=%s %s" % (dup_code, fresh_kind, fresh_reason[:160], resume_kind, resume_reason[:160]),
+        )
+    finally:
+        promoted.close()
+
+    gated = World()
+    try:
+        task_id = "gate-task"
+        session_id = "sess-gate"
+        version = _publish_plan(session_id, task_id)["version"]
+        script = "log('stage')"
+
+        def workflow(tool_id, stage=None, **fields):
+            payload = _workflow_call(gated, script, gated.sonnet_transcript, session_id, tool_id)
+            if stage is not None:
+                payload["tool_input"]["args"] = {"router_stage": stage}
+            payload["tool_input"].update(fields)
+            _plant_guard_attest(gated, session_id, tool_id)
+            return payload
+
+        stage = {"task_id": task_id, "plan_version": version, "stage_id": "draft"}
+        first_kind, first_reason = verdict(run_gate(gated, workflow("wf-ok", stage)))
+        started = _stage_rows(gated, task_id, "draft")
+        dup_kind, dup_reason = verdict(run_gate(gated, workflow("wf-dup", stage)))
+        stale = dict(stage)
+        stale["plan_version"] = 99
+        stale_kind, stale_reason = verdict(run_gate(gated, workflow("wf-stale", stale)))
+        invalid = dict(stage)
+        invalid["extra"] = "no"
+        invalid_kind, invalid_reason = verdict(run_gate(gated, workflow("wf-bad", invalid)))
+        opus_args = {"router_stage": {"task_id": task_id, "plan_version": version, "stage_id": "review"}, "note": "opus"}
+        opus_payload = workflow("wf-opus")
+        opus_payload["tool_input"]["args"] = opus_args
+        opus_kind, opus_reason = verdict(run_gate(gated, opus_payload))
+        plain_kind, plain_reason = verdict(run_gate(gated, workflow("wf-plain")))
+        resume_payload = workflow("wf-resume", {"task_id": task_id, "plan_version": version, "stage_id": "notes"})
+        resume_payload["tool_input"]["resumeFromRunId"] = "run-old"
+        resume_kind, resume_reason = verdict(run_gate(gated, resume_payload))
+        opus_session = "sess-gate-opus"
+        missing_id = "wf-missing-mod"
+        _plant_guard_attest(gated, opus_session, missing_id)
+        missing = _workflow_call(gated, script, gated.opus_transcript, opus_session, missing_id)
+        missing["tool_input"]["args"] = {"router_stage": stage}
+        missing_kind, missing_reason = verdict(run_gate(gated, missing, {
+            "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": "sonnet",
+            "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS": "4",
+        }))
+        stage_ids = [row.get("workflow_tool_use_id") for row in rows(gated, "stages")]
+        suite.check(
+            "R8",
+            "router_stage reserves only after the workflow is allowed",
+            first_kind == "allow" and started and started[0]["status"] == "started"
+            and dup_kind == "deny" and dup_reason.startswith("ROUTER_STAGE_DUPLICATE; run router-plan show %s" % task_id)
+            and stale_kind == "deny" and stale_reason.startswith("ROUTER_PLAN_STALE; run router-plan show %s" % task_id)
+            and invalid_kind == "deny" and invalid_reason == "ROUTER_STAGE_INVALID"
+            and opus_kind == "deny" and opus_reason == "OPUS_WORKFLOW_DENIED reason=args"
+            and plain_kind == "allow"
+            and resume_kind == "deny" and "resumeFromRunId" in resume_reason
+            and missing_kind == "deny"
+            and stage_ids == ["wf-ok"],
+            "first=%s %s dup=%s stale=%s invalid=%s opus=%s plain=%s %s resume=%s missing=%s ids=%s" % (
+                first_kind, first_reason[:80], dup_reason[:80], stale_reason[:80], invalid_reason,
+                opus_reason, plain_kind, plain_reason[:80], resume_reason[:80], missing_reason[:80], stage_ids,
+            ),
+        )
+    finally:
+        gated.close()
+
+    expired = World()
+    try:
+        _set_planning(expired, True)
+        task_id = "expire-task"
+        session_id = "sess-expire-replan"
+        version = _publish_plan(session_id, task_id)["version"]
+        agent_id = "a" + "e" * 16
+        _reserve_worker(expired, session_id, task_id, version, "draft", "wf-exp", "prompt-exp", agent_id)
+        _worker_stop(expired, session_id, agent_id, _replan_footer(task_id, "draft", version), expired.opus_transcript)
+        request_id = next(
+            row["request_id"] for row in rows(expired, "requests") if row.get("plan_task_id") == task_id
+        )
+        import sqlite3
+        db = expired.home / ".claude" / "logs" / "opus-arbitration" / "ledger.db"
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE requests SET expires=? WHERE request_id=?", (time.time() - 5, request_id))
+        conn.execute(
+            "UPDATE stages SET created=? WHERE task_id=? AND stage_id='draft'",
+            (time.time() - 4000, task_id),
+        )
+        conn.commit()
+        conn.close()
+        arb.record_event("tick-replan", session_id=session_id)
+        shown = arb.show_request(request_id) or {}
+        status = subprocess.run(
+            [sys.executable, str(CLI), "status"],
+            text=True, capture_output=True, env=expired.env(), cwd=str(expired.project), timeout=30, check=False,
+        )
+        suite.check(
+            "R11",
+            "an expired replan is unresolved follow-through",
+            shown.get("state") == "EXPIRED" and shown.get("decision") == "NO_FOLLOW_THROUGH"
+            and request_id in status.stdout and "from_state=REPLAN_PENDING" in status.stdout,
+            "state=%s decision=%s status=%s" % (shown.get("state"), shown.get("decision"), status.stdout[-400:]),
+        )
+        suite.check(
+            "R13",
+            "a stage open for more than an hour is marked stale",
+            " stale" in status.stdout and "stage=draft" in status.stdout,
+            status.stdout[-400:],
+        )
+    finally:
+        expired.close()
+
+
+class _Proc:
+    def __init__(self, code, stdout, stderr):
+        self.returncode = code
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _load_gate():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("opus_gate_wp3b", ROOT / "opus-arbitration-gate.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _run_gate_inprocess(gate, world, payload, extra=None):
+    import io
+
+    saved = dict(os.environ)
+    env = world.env(extra)
+    old_in, old_out, old_err = sys.stdin, sys.stdout, sys.stderr
+    sys.stdin = io.StringIO(json.dumps(payload))
+    sys.stdout = io.StringIO()
+    sys.stderr = io.StringIO()
+    os.environ.clear()
+    os.environ.update(env)
+    try:
+        code = gate.main()
+        return _Proc(code, sys.stdout.getvalue(), sys.stderr.getvalue())
+    finally:
+        sys.stdin, sys.stdout, sys.stderr = old_in, old_out, old_err
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+def _opus_replan(session_id, task_id, stage):
+    return arb.register_candidate(
+        session_id=session_id,
+        task_id=task_id,
+        trigger="WORKFLOW_WORKER_REQUEST",
+        reason_code="PLAN_REVISION_REQUIRED",
+        candidate_type="REPLAN_REQUEST",
+        plan_task_id=task_id,
+        key_override=arb.replan_candidate_key(task_id, 1, stage, "PLAN_REVISION_REQUIRED"),
+        skip_judgment_quota=True,
+        follow_state="REPLAN_PENDING",
+        scope_digest=stage,
+    )
+
+
+def test_wp3b(suite):
+    pinned = {
+        "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": "sonnet",
+        "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS": "4",
+    }
+    world = World()
+    saved_start = arb.stage_start
+    try:
+        task_id = "cap-task"
+        session_id = "sess-cap-stage"
+        version = _publish_plan(
+            session_id, task_id, steps=("draft", "review", "notes", "extra"),
+        )["version"]
+        script = "log('stage')"
+
+        def launch(tool_id, stage_id):
+            _plant_workflow_runtime(world, session_id, tool_id)
+            payload = _workflow_call(world, script, world.opus_transcript, session_id, tool_id)
+            payload["tool_input"]["args"] = {
+                "router_stage": {"task_id": task_id, "plan_version": version, "stage_id": stage_id},
+            }
+            return payload
+
+        first_kind, first_reason = verdict(run_gate(world, launch("wf-cap-a", "draft"), pinned))
+        second_kind, second_reason = verdict(run_gate(world, launch("wf-cap-b", "review"), pinned))
+        dup_kind, dup_reason = verdict(run_gate(world, launch("wf-cap-dup", "draft"), pinned))
+        race_payload = launch("wf-cap-race", "race")
+        gate = _load_gate()
+
+        def deny_start(*_args, **_kwargs):
+            return (False, "ROUTER_STAGE_DUPLICATE", None)
+
+        arb.stage_start = deny_start
+        try:
+            race_kind, race_reason = verdict(_run_gate_inprocess(gate, world, race_payload, pinned))
+        finally:
+            arb.stage_start = saved_start
+        race_row = next(
+            (row for row in rows(world, "workflows") if row.get("tool_use_id") == "wf-cap-race"),
+            None,
+        )
+        third_kind, third_reason = verdict(run_gate(world, launch("wf-cap-c", "notes"), pinned))
+        fourth_kind, fourth_reason = verdict(run_gate(world, launch("wf-cap-d", "extra"), pinned))
+        launched = [
+            row for row in rows(world, "workflows")
+            if row.get("session_id") == session_id and row.get("status") == "launched"
+        ]
+        dup_rows = [row for row in rows(world, "workflows") if row.get("tool_use_id") == "wf-cap-dup"]
+        suite.check(
+            "W3",
+            "a stage-denied workflow does not spend a session slot",
+            first_kind == "allow" and second_kind == "allow"
+            and dup_kind == "deny" and dup_reason.startswith("ROUTER_STAGE_DUPLICATE")
+            and not dup_rows
+            and race_kind == "deny" and race_reason.startswith("ROUTER_STAGE_DUPLICATE")
+            and isinstance(race_row, dict) and race_row.get("status") == "denied_stage"
+            and not _stage_rows(world, task_id, "race")
+            and third_kind == "allow"
+            and fourth_kind == "deny" and "reason=session" in fourth_reason
+            and len(launched) == 3,
+            "1=%s 2=%s dup=%s %s race=%s %s third=%s %s fourth=%s %s launched=%s row=%s" % (
+                first_kind, second_kind, dup_kind, dup_reason[:60],
+                race_kind, race_reason[:60], third_kind, third_reason[:60],
+                fourth_kind, fourth_reason[:60], len(launched),
+                None if race_row is None else race_row.get("status"),
+            ),
+        )
+
+        busy_id = "wf-busy"
+        plain_id = "wf-plain-busy"
+        busy_session = "sess-busy"
+        _plant_guard_attest(world, busy_session, busy_id)
+        _plant_guard_attest(world, busy_session, plain_id)
+        busy_payload = _workflow_call(world, script, world.sonnet_transcript, busy_session, busy_id)
+        busy_payload["tool_input"]["args"] = {
+            "router_stage": {"task_id": task_id, "plan_version": version, "stage_id": "extra"},
+        }
+        plain_payload = _workflow_call(world, script, world.sonnet_transcript, busy_session, plain_id)
+
+        def boom(*_args, **_kwargs):
+            raise arb.GateBusy()
+
+        arb.stage_start = boom
+        try:
+            busy_kind, busy_reason = verdict(_run_gate_inprocess(gate, world, busy_payload))
+            plain_kind, plain_reason = verdict(_run_gate_inprocess(gate, world, plain_payload))
+        finally:
+            arb.stage_start = saved_start
+        suite.check(
+            "W3",
+            "a stage reservation error denies and leaves no stage row",
+            busy_kind == "deny" and busy_reason == "ROUTER_STAGE_BUSY"
+            and not _stage_rows(world, task_id, "extra")
+            and plain_kind == "allow",
+            "busy=%s %s plain=%s %s" % (busy_kind, busy_reason[:120], plain_kind, plain_reason[:120]),
+        )
+    finally:
+        arb.stage_start = saved_start
+        world.close()
+
+    quota = World()
+    try:
+        _set_planning(quota, True, judgments=2)
+        session_id = "sess-quota-replan"
+        task_id = "quota-task"
+        made = [_opus_replan(session_id, task_id, stage) for stage in ("draft", "review")]
+        resolved = arb.resolve_open_replans(task_id, "PLAN_PROMOTED")
+        replans = [
+            row for row in rows(quota, "requests")
+            if row.get("candidate_type") == "REPLAN_REQUEST" and row.get("plan_task_id") == task_id
+        ]
+        later = arb.register_candidate(
+            session_id=session_id,
+            task_id=task_id,
+            trigger="T02",
+            reason_code="UNAPPROVED_OPUS",
+            scope_digest="after-replans",
+        )
+        promoted = None
+        if later.get("ok") and isinstance(later.get("request"), dict):
+            promoted = arb.promote_pending(later["request"]["request_id"])
+        suite.check(
+            "W3",
+            "two resolved Opus replans still leave a judgment",
+            all(item.get("ok") for item in made) and resolved == 2
+            and len(replans) == 2
+            and all(
+                row.get("state") == "REPLAN_RESOLVED"
+                and row.get("packet_digest") is None
+                and row.get("judge_tool_use_id") is None
+                for row in replans
+            )
+            and later.get("ok") is True
+            and isinstance(promoted, dict) and promoted.get("state") == "JUDGE_PENDING",
+            "made=%s resolved=%s later=%s promoted=%s" % (
+                [(item.get("ok"), item.get("reason")) for item in made],
+                resolved,
+                later.get("reason"),
+                None if not isinstance(promoted, dict) else promoted.get("state"),
+            ),
+        )
+    finally:
+        quota.close()
+
+    counted = World()
+    try:
+        _set_planning(counted, True, judgments=1)
+        session_id = "sess-sonnet-quota"
+        task_id = "sonnet-quota"
+        made = arb.register_candidate(
+            session_id=session_id,
+            task_id=task_id,
+            trigger="WORKFLOW_WORKER_REQUEST",
+            reason_code="PLAN_REVISION_REQUIRED",
+            candidate_type="REPLAN_REQUEST",
+            plan_task_id=task_id,
+            key_override=arb.replan_candidate_key(task_id, 1, "draft", "PLAN_REVISION_REQUIRED"),
+            scope_digest="sonnet-draft",
+        )
+        promoted = None
+        if made.get("ok") and isinstance(made.get("request"), dict):
+            promoted = arb.promote_pending(made["request"]["request_id"])
+        blocked = arb.register_candidate(
+            session_id=session_id,
+            task_id=task_id,
+            trigger="T02",
+            reason_code="UNAPPROVED_OPUS",
+            scope_digest="after-sonnet-replan",
+        )
+        suite.check(
+            "W3",
+            "a Sonnet replan that reached the judge still counts",
+            made.get("ok") is True
+            and isinstance(promoted, dict)
+            and promoted.get("state") == "JUDGE_PENDING"
+            and promoted.get("packet_digest")
+            and blocked.get("ok") is False
+            and blocked.get("reason") == "QUOTA_EXHAUSTED",
+            "made=%s promoted=%s blocked=%s" % (
+                made.get("reason"),
+                None if not isinstance(promoted, dict) else promoted.get("state"),
+                blocked.get("reason"),
+            ),
+        )
+    finally:
+        counted.close()
+
+    linked = World()
+    try:
+        _set_planning(linked, True)
+        session_id = "sess-corr"
+        done = "done-task"
+        old = "old-task"
+        done_version = _publish_plan(session_id, done)["version"]
+        old_version = _publish_plan(session_id, old)["version"]
+        done_agent = "a" + "d" * 16
+        old_agent = "a" + "e" * 16
+        done_ready = _reserve_worker(
+            linked, session_id, done, done_version, "draft", "wf-done", "prompt-done", done_agent,
+        )
+        old_ready = _reserve_worker(
+            linked, session_id, old, old_version, "draft", "wf-old", "prompt-old", old_agent,
+        )
+        finished = arb.stage_finish(done, done_version, "draft", "completed")
+        superseded = _publish_plan(session_id, old, base_version=old_version)
+        done_stop = _worker_stop(
+            linked, session_id, done_agent,
+            _replan_footer(done, "draft", done_version, unresolved=["finished stage"]),
+            linked.opus_transcript,
+        )
+        old_stop = _worker_stop(
+            linked, session_id, old_agent,
+            _replan_footer(old, "draft", old_version, unresolved=["superseded stage"]),
+            linked.opus_transcript,
+        )
+        events = (
+            linked.home / ".claude" / "logs" / "opus-arbitration" / "events.jsonl"
+        ).read_text(encoding="utf-8")
+        requests = rows(linked, "requests")
+
+        def kinds_for(task):
+            return [
+                row.get("candidate_type") for row in requests
+                if row.get("task_id") == task or row.get("plan_task_id") == task
+            ]
+
+        done_stage = _stage_rows(linked, done, "draft")
+        old_stage = _stage_rows(linked, old, "draft")
+        suite.check(
+            "W3",
+            "a finished stage does not correlate",
+            done_ready and finished is True and done_stop.returncode == 0
+            and "replan_uncorrelated" in events
+            and "REPLAN_REQUEST" not in kinds_for(done)
+            and "EXECUTOR_ESCALATION" in kinds_for(done)
+            and done_stage and done_stage[0]["status"] == "completed",
+            "kinds=%s status=%s" % (
+                kinds_for(done),
+                None if not done_stage else done_stage[0].get("status"),
+            ),
+        )
+        suite.check(
+            "W3",
+            "a superseded stage does not correlate",
+            old_ready and superseded["version"] == old_version + 1
+            and old_stop.returncode == 0
+            and events.count("replan_uncorrelated") >= 2
+            and "REPLAN_REQUEST" not in kinds_for(old)
+            and "EXECUTOR_ESCALATION" in kinds_for(old)
+            and old_stage and old_stage[0]["status"] == "started"
+            and old_stage[0]["plan_version"] == old_version,
+            "kinds=%s status=%s version=%s" % (
+                kinds_for(old),
+                None if not old_stage else old_stage[0].get("status"),
+                None if not old_stage else old_stage[0].get("plan_version"),
+            ),
+        )
+    finally:
+        linked.close()
+
+
 def main():
     suite = Suite()
     test_resolution(suite)
@@ -3306,6 +4870,10 @@ def main():
     test_hardening2(suite)
     test_strict_rules(suite)
     test_workflow_and_auto(suite)
+    test_plan_ledger(suite)
+    test_planner(suite)
+    test_replan(suite)
+    test_wp3b(suite)
     suite.check(
         "REF",
         "gate output never contains permissionDecision allow",

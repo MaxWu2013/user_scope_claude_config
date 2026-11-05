@@ -37,6 +37,10 @@ WRITER_READ_DENY = "file-writer may only Read documents."
 WRITER_OBSIDIAN_READ_DENY = "file-writer may not read the vault through Obsidian."
 STATE_DENY = "Specs, memory and plans belong to the orchestrator. Report back instead."
 CURSOR_AGENT_DENY = "Start cursor-agent only through ~/.claude/hooks/bin/cursor-run <spec>."
+ROUTER_PLAN_DENY = "router-plan must be invoked alone with plain arguments."
+ROUTER_PLAN = "~/.claude/hooks/bin/router-plan"
+SAFE = "~/.claude/hooks/bin/safe-read"
+CURSOR_RUN_CMD = "~/.claude/hooks/bin/cursor-run"
 READ_LINE_EXTRA = " Read a smaller range with offset and limit, or use file-reader for large files."
 
 
@@ -460,6 +464,42 @@ def all_writes_cases(suite, home, other, tree, log_root, read_main, bash_read):
         "silent",
         CLAUDE_ROUTING="off",
     )
+    expect_aw(
+        "all-writes main router-plan -> silent",
+        orchestrator("Bash", bash(f"{ROUTER_PLAN} show task-1")),
+        "silent",
+    )
+    expect_aw(
+        "all-writes main router-plan newline -> deny",
+        orchestrator("Bash", bash(f"{ROUTER_PLAN} show task-1\nls")),
+        "deny",
+        ROUTER_PLAN_DENY,
+    )
+    read_reason = read_deny("reading files or full diffs through Bash")
+    local_broken = (
+        (f"{SAFE} git-status\nrm -rf x", read_reason),
+        (f"{SAFE} rg x .\r\ncat f", read_reason),
+        (f"{CURSOR_RUN_CMD} new t\nls", CURSOR_AGENT_DENY),
+    )
+    for command, reason in local_broken:
+        expect_aw(
+            "all-writes main broken allow -> deny",
+            orchestrator("Bash", bash(command)),
+            "deny",
+            reason,
+        )
+        expect_aw(
+            "all-writes file-reader broken allow -> deny",
+            reader("Bash", bash(command)),
+            "deny",
+            READER_BASH_DENY,
+        )
+        expect_aw(
+            "all-writes Explore broken allow -> deny",
+            payload("Bash", bash(command), agent_id="explore-1", agent_type="Explore"),
+            "deny",
+            READER_BASH_DENY,
+        )
 
 
 def routing_reads_cases(suite, home, other, tree, log_root, read_main, bash_read):

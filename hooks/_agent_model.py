@@ -890,20 +890,18 @@ def non_opus_baseline(payload, tool_input):
     return main
 
 
-def judge_definition_status(payload, judge_type):
-    """ok, shadowed, or invalid for the opus-judge exemption.
+def _strict_opus_tools_status(payload, agent_type):
+    """ok, shadowed, or invalid for a pinned opus agent with an empty tools list.
 
-    The exemption needs subagent type opus-judge, no project file at
-    <project>/.claude/agents/opus-judge.md, and a regular user file whose
-    strict frontmatter has model: opus and tools: [] exactly.
+    A project file at <project>/.claude/agents/<agent_type>.md shadows the
+    user file. The user file must be a regular file whose strict frontmatter
+    has model: opus and tools: [] exactly.
     """
-    if judge_type != "opus-judge":
-        return "invalid"
     project = _agent_project(payload if isinstance(payload, dict) else {})
-    project_file = os.path.join(project, ".claude", "agents", "opus-judge.md")
+    project_file = os.path.join(project, ".claude", "agents", agent_type + ".md")
     if os.path.lexists(project_file):
         return "shadowed"
-    user_file = os.path.join(os.path.expanduser("~"), ".claude", "agents", "opus-judge.md")
+    user_file = os.path.join(os.path.expanduser("~"), ".claude", "agents", agent_type + ".md")
     try:
         info = os.lstat(user_file)
     except OSError:
@@ -915,6 +913,70 @@ def judge_definition_status(payload, judge_type):
         return "invalid"
     if fields.get("model") != "opus" or fields.get("tools") != []:
         return "invalid"
+    return "ok"
+
+
+def judge_definition_status(payload, judge_type):
+    """ok, shadowed, or invalid for the opus-judge exemption.
+
+    The exemption needs subagent type opus-judge, no project file at
+    <project>/.claude/agents/opus-judge.md, and a regular user file whose
+    strict frontmatter has model: opus and tools: [] exactly.
+    """
+    if judge_type != "opus-judge":
+        return "invalid"
+    return _strict_opus_tools_status(payload, "opus-judge")
+
+
+def _plugin_agent_named(agent_type):
+    """True when any installed plugin has agents/<agent_type>.md."""
+    if not isinstance(agent_type, str) or not _AGENT_TYPE_RE.fullmatch(agent_type):
+        return False
+    catalog = os.path.join(os.path.expanduser("~"), ".claude", "plugins", "installed_plugins.json")
+    blob = _read_capped(catalog, _PLUGINS_CAP)
+    if blob is None:
+        return False
+    try:
+        data = json.loads(blob.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, ValueError, TypeError):
+        return False
+    plugins = data.get("plugins") if isinstance(data, dict) else None
+    if not isinstance(plugins, dict):
+        return False
+    root = _plugins_root()
+    for installs in plugins.values():
+        if not isinstance(installs, list):
+            continue
+        for item in installs:
+            if not isinstance(item, dict):
+                continue
+            install = item.get("installPath")
+            if not isinstance(install, str) or not install.strip():
+                continue
+            if not _realpath_inside(root, install) or not _unlinked_below(root, install):
+                continue
+            parent = os.path.join(install, "agents")
+            if not _realpath_inside(root, parent) or not _unlinked_below(root, parent):
+                continue
+            agent_path = os.path.join(parent, agent_type + ".md")
+            if os.path.lexists(agent_path):
+                return True
+    return False
+
+
+def planner_definition_status(payload, planner_type):
+    """ok, PLANNER_SHADOWED, or PLANNER_DEFINITION_INVALID.
+
+    The user definition must be model opus with tools []. A project file or a
+    plugin agent of the same name shadows it.
+    """
+    if not isinstance(planner_type, str) or not _AGENT_TYPE_RE.fullmatch(planner_type):
+        return "PLANNER_DEFINITION_INVALID"
+    status = _strict_opus_tools_status(payload, planner_type)
+    if status == "shadowed" or _plugin_agent_named(planner_type):
+        return "PLANNER_SHADOWED"
+    if status != "ok":
+        return "PLANNER_DEFINITION_INVALID"
     return "ok"
 
 

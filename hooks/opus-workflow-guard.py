@@ -269,6 +269,13 @@ def _surface(arb, data):
         text = arb.format_candidate_request(request, mode)
         if text:
             texts.append(text)
+    for request in arb.pending_replan_requests(session_id):
+        text = arb.format_replan_required(request)
+        if text:
+            texts.append(text)
+    for line in arb.take_surface_lines(session_id):
+        if line:
+            texts.append(line)
     if path and os.path.lexists(path):
         try:
             os.unlink(path)

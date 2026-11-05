@@ -231,6 +231,31 @@ def ask(cls, path):
     return 0
 
 
+def _exact_router_plan(cmd):
+    """The same plain hooks-path form route-tools allows for the main session.
+
+    A line break is rejected before the match. Horizontal space only.
+    """
+    if not isinstance(cmd, str) or cmd == "" or "\n" in cmd or "\r" in cmd:
+        return False
+    home = re.escape(os.path.expanduser("~"))
+    pattern = (
+        r"^[ \t]*(?:~|" + home + r")/\.claude/hooks/bin/router-plan[ \t]+"
+        r"[^\"$`\\;&|<>()]+$"
+    )
+    return re.match(pattern, cmd) is not None
+
+
+def _router_plan_mentioned(cmd):
+    if not isinstance(cmd, str) or cmd == "":
+        return False
+    home = re.escape(os.path.expanduser("~"))
+    pattern = (
+        r"(?:~|" + home + r")/\.claude/hooks/bin/router-plan(?![A-Za-z0-9._-])"
+    )
+    return re.search(pattern, cmd) is not None
+
+
 def decide(hook_input):
     try:
         d = json.loads(hook_input or "")
@@ -295,8 +320,13 @@ def decide(hook_input):
         processed_cmd = scrub_command(remove_quoted_spans(cmd))
         # Every Claude caller, main session and subagents. CLAUDE_ROUTING is
         # ignored. When cursor-run is not installed, this check is skipped.
+        # The headless scan runs before an exact router-plan allow.
         if cursor_run_ready() and is_headless_cursor_agent(cmd, processed_cmd):
             return deny_headless()
+        if _router_plan_mentioned(cmd):
+            if _exact_router_plan(cmd):
+                return 0
+            return deny()
         processed_cmd = scrub_command(remove_quoted_spans(strip_heredoc_bodies(cmd)))
         if GENERATOR_WRITE.search(processed_cmd):
             return deny()

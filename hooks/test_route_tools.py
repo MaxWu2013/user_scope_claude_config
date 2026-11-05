@@ -253,6 +253,8 @@ def main():
         case_24(suite)
         case_25(suite, extra_dirs)
         case_26(suite)
+        case_27(suite)
+        case_28(suite)
         default_records = log_records(log_path)
         allow_logs = [rec for rec in default_records if rec.get("decision") == "allow-log"]
         suite.check(
@@ -2184,6 +2186,10 @@ def case_25(suite, extra_dirs):
 
 
 SESSION_COST_DENY = "session-cost must be invoked alone with plain arguments."
+ROUTER_PLAN_MAIN_ONLY = "router-plan is main-session only"
+ROUTER_PLAN_DENY = "router-plan must be invoked alone with plain arguments."
+ROUTER_PLAN = "~/.claude/hooks/bin/router-plan"
+ROUTER_PLAN_ABS = f"{HOME}/.claude/hooks/bin/router-plan"
 SESSION_COST = "~/.claude/hooks/bin/session-cost"
 SESSION_COST_ABS = f"{HOME}/.claude/hooks/bin/session-cost"
 SESSION_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
@@ -2244,6 +2250,114 @@ def case_26(suite):
         "deny",
         WRITER_BASH_DENY,
     )
+
+
+def case_27(suite):
+    plain = f"{ROUTER_PLAN} show task-1"
+    absolute = f"{ROUTER_PLAN_ABS} validate /tmp/plan.json"
+    suite.expect("27", "main router-plan -> silent", orchestrator("Bash", bash(plain)), "silent")
+    suite.expect("27", "main absolute router-plan -> silent", orchestrator("Bash", bash(absolute)), "silent")
+    suite.expect(
+        "27",
+        "main indented router-plan -> silent",
+        orchestrator("Bash", bash(f"  {plain}")),
+        "silent",
+    )
+    denied = (
+        (reader("Bash", bash(plain)), "file-reader"),
+        (writer("Bash", bash(plain)), "file-writer"),
+        (payload("Bash", bash(plain), agent_id="explore-1", agent_type="Explore"), "Explore"),
+        (other("Bash", bash(plain), agent_type="workflow-subagent"), "workflow-subagent"),
+        (other("Bash", bash(plain), agent_type="general-purpose"), "general-purpose"),
+    )
+    for body, label in denied:
+        suite.expect("27", "%s router-plan -> deny" % label, body, "deny", ROUTER_PLAN_MAIN_ONLY)
+    unsafe = (
+        (f"{plain} | cat", "pipe"),
+        (f"{plain}; ls", "semicolon"),
+        (f"{plain} > /tmp/router-plan-out", "redirect"),
+        (f"{plain} $(id)", "substitution"),
+        (f"{plain} `id`", "backticks"),
+    )
+    for command, label in unsafe:
+        suite.expect(
+            "27",
+            "main router-plan %s -> deny" % label,
+            orchestrator("Bash", bash(command)),
+            "deny",
+            ROUTER_PLAN_DENY,
+        )
+    suite.expect(
+        "27",
+        "code hook allows exact router-plan",
+        orchestrator("Bash", bash(plain)),
+        "silent",
+        hook=CODE_HOOK,
+    )
+    suite.expect(
+        "27",
+        "reader safe-read mentioning router-plan -> silent",
+        reader("Bash", bash(f"{SAFE} rg x {ROUTER_PLAN}")),
+        "silent",
+    )
+    broken = (
+        (f"{plain}\nls", "newline then ls"),
+        (f"{plain}\ncursor-agent -p y", "newline then cursor-agent"),
+        (f"{plain}\rcat f", "carriage return then cat"),
+        (f"{plain}\n", "trailing newline"),
+    )
+    for command, label in broken:
+        suite.expect(
+            "27",
+            "main router-plan %s -> deny" % label,
+            orchestrator("Bash", bash(command)),
+            "deny",
+            CURSOR_AGENT_DENY if "cursor-agent" in command else ROUTER_PLAN_DENY,
+        )
+        completed = suite.run(orchestrator("Bash", bash(command)), hook=CODE_HOOK)
+        suite.check(
+            "27",
+            "code hook router-plan %s -> deny" % label,
+            completed.returncode == 2 and completed.stdout == "",
+            "exit=%s stdout=%r stderr=%r" % (completed.returncode, completed.stdout[:120], completed.stderr[:160]),
+        )
+    suite.expect(
+        "27",
+        "main session-cost newline -> deny",
+        orchestrator("Bash", bash(f"{SESSION_COST} {SESSION_ID}\ncat f")),
+        "deny",
+        SESSION_COST_DENY,
+    )
+
+
+def case_28(suite):
+    """A line break is not whitespace in an exact safe-read or cursor-run allow."""
+    read_reason = read_deny("reading files or full diffs through Bash")
+    broken = (
+        (f"{SAFE} git-status\nrm -rf x", READER_BASH_DENY, read_reason),
+        (f"{SAFE} rg x .\r\ncat f", READER_BASH_DENY, read_reason),
+        (f"{CURSOR_RUN_CMD} new t\nls", READER_BASH_DENY, CURSOR_AGENT_DENY),
+    )
+    roles = (
+        (reader, "file-reader"),
+        (lambda tool, tool_input: payload(tool, tool_input, agent_id="explore-1", agent_type="Explore"), "Explore"),
+    )
+    for command, reader_reason, main_reason in broken:
+        for make, label in roles:
+            suite.expect(
+                "28",
+                "%s %s -> deny" % (label, command.replace("\n", "\\n").replace("\r", "\\r")),
+                make("Bash", bash(command)),
+                "deny",
+                reader_reason,
+            )
+        suite.expect(
+            "28",
+            "main %s -> deny" % command.replace("\n", "\\n").replace("\r", "\\r"),
+            orchestrator("Bash", bash(command)),
+            "deny",
+            main_reason,
+        )
 
 
 if __name__ == "__main__":

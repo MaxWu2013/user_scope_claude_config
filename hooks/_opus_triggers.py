@@ -16,8 +16,21 @@ _FOOTER_KEYS = frozenset({
     "attempts",
     "suggested_scope",
 })
+_FOOTER_V2_KEYS = _FOOTER_KEYS | frozenset({
+    "plan_id",
+    "plan_version",
+    "stage_id",
+    "workflow_run_id",
+    "unresolved_question",
+    "completed_stage_ids",
+    "failed_requirement_ids",
+    "requested_action",
+})
 _FOOTER_REQUIRED = frozenset({"schema_version", "task_id", "status"})
 _FOOTER_STATUS = frozenset({"COMPLETED", "NEEDS_JUDGMENT", "BLOCKED", "FAILED"})
+_PLAN_REASONS = frozenset({"PLAN_REQUIRED", "PLAN_REVISION_REQUIRED"})
+_REQUESTED_ACTIONS = frozenset({"REPLAN", "PLAN", "NONE"})
+_STEP_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
 _ENV_STATUS = frozenset({
     "timeout",
     "launch_error",
@@ -74,7 +87,11 @@ def _failure_text(footer):
 
 
 def parse_footer(text):
-    """Last worker footer with schema_version 1 and status, or None."""
+    """Last worker footer with schema_version 1 or 2 and status, or None.
+
+    V1 keys and checks are unchanged. The last object that claims a version
+    and a status is the candidate; it is then validated.
+    """
     if not isinstance(text, str) or text.strip() == "":
         return None
     decoder = json.JSONDecoder()
@@ -94,25 +111,40 @@ def parse_footer(text):
         index = max(end, index + 1)
     chosen = None
     for obj in found:
-        if obj.get("schema_version") == 1 and "status" in obj:
+        if obj.get("schema_version") in (1, 2) and "status" in obj:
             chosen = obj
     if chosen is None:
         return None
     return _validate_footer(chosen)
 
 
+def _bounded_str(value, limit):
+    return isinstance(value, str) and len(value) <= limit
+
+
+def _stage_id_list(value):
+    if not isinstance(value, list) or len(value) > 20:
+        return False
+    return all(isinstance(item, str) and _STEP_ID_RE.fullmatch(item) for item in value)
+
+
 def _validate_footer(obj):
-    if set(obj) - _FOOTER_KEYS:
+    version = obj.get("schema_version")
+    if type(version) is not int or version not in (1, 2):
+        return None
+    allowed = _FOOTER_KEYS if version == 1 else _FOOTER_V2_KEYS
+    if set(obj) - allowed:
         return None
     if not _FOOTER_REQUIRED <= set(obj):
-        return None
-    if type(obj.get("schema_version")) is not int or obj.get("schema_version") != 1:
         return None
     if not isinstance(obj.get("task_id"), str) or obj.get("task_id") == "":
         return None
     if obj.get("status") not in _FOOTER_STATUS:
         return None
     if "reason_code" in obj and not isinstance(obj.get("reason_code"), str):
+        return None
+    reason = obj.get("reason_code")
+    if reason in _PLAN_REASONS and obj.get("status") != "NEEDS_JUDGMENT":
         return None
     if "suggested_scope" in obj and not isinstance(obj.get("suggested_scope"), str):
         return None
@@ -126,6 +158,34 @@ def _validate_footer(obj):
         attempts = obj.get("attempts")
         if not isinstance(attempts, list) or not all(isinstance(item, dict) for item in attempts):
             return None
+    if version == 1:
+        return obj
+    if "plan_id" in obj and not _bounded_str(obj.get("plan_id"), 64):
+        return None
+    if "plan_version" in obj:
+        plan_version = obj.get("plan_version")
+        if type(plan_version) is not int or plan_version < 1:
+            return None
+    if "stage_id" in obj:
+        stage_id = obj.get("stage_id")
+        if not isinstance(stage_id, str) or _STEP_ID_RE.fullmatch(stage_id) is None:
+            return None
+    if "workflow_run_id" in obj and not _bounded_str(obj.get("workflow_run_id"), 128):
+        return None
+    if "unresolved_question" in obj and not _bounded_str(obj.get("unresolved_question"), 300):
+        return None
+    if "completed_stage_ids" in obj and not _stage_id_list(obj.get("completed_stage_ids")):
+        return None
+    if "failed_requirement_ids" in obj:
+        failed = obj.get("failed_requirement_ids")
+        if (
+            not isinstance(failed, list)
+            or len(failed) > 20
+            or not all(_bounded_str(item, 100) for item in failed)
+        ):
+            return None
+    if "requested_action" in obj and obj.get("requested_action") not in _REQUESTED_ACTIONS:
+        return None
     return obj
 
 

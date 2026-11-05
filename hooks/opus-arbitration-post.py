@@ -260,6 +260,10 @@ def _handle(payload):
         arb.record_agent_resumed(payload)
         return 0
     if tool == "Workflow":
+        # PostToolUseFailure matches Agent|Bash only (settings.json), so a
+        # failed Workflow never arrives here. The reserved stage stays started
+        # until `router-plan stage finish <task> <version> <stage> --status failed`.
+        # opus-arbitration status marks stages open for more than an hour stale.
         try:
             arb.note_workflow_result(payload)
         except Exception:
@@ -290,6 +294,10 @@ def _handle(payload):
         return _emit(event_name, alert)
     if _is_judge(payload):
         return _emit(event_name, _decision_text(arb.ingest_judge_result(payload), payload))
+    if isinstance(recorded, dict) and recorded.get("kind") == "planner":
+        if recorded.get("status") == "completed" and not _inside(payload):
+            return _emit(event_name, arb.ingest_planner_result(payload))
+        return 0
     return _agent_other(payload, event_name)
 
 

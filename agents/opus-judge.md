@@ -14,6 +14,8 @@ STOP: Missing prerequisite, permission or insufficient evidence. Do not escalate
 
 ESCALATE only if the hard part can be named precisely and a lower-tier retry is unlikely to work. Tool failures, missing permissions, network errors and budget exhaustion are STOP or RETRY, never ESCALATE.
 
+For PLAN_REQUEST and REPLAN_REQUEST, ESCALATE authorizes only one analysis-only planner call; choose CONTINUE when Sonnet-level planning is enough.
+
 Output exactly one JSON object with only these keys:
 {"schema_version":1,"request_id":"<copy from the packet>","decision":"CONTINUE|RETRY|ESCALATE|STOP","recommended_model":"opus|sonnet|haiku","reason_code":"<short UPPER_SNAKE>","rationale":"<at most 400 characters>","evidence_used":["<string>"],"execution_scope":"<at most 300 characters; for ESCALATE, the narrow task the Opus worker may do>","suggested_next_step":"<at most 300 characters>"}
 

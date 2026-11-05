@@ -46,6 +46,11 @@ _ARBITRATION_TASK = (
     "without a packet, and never use background or nested Opus agents."
 )
 _ARBITRATION_STRICT = "Opus subagents are denied in strict mode; use sonnet or haiku."
+_PLANNING_TASK = (
+    "Complex multi-stage work: if you are Opus, write the plan yourself and run router-plan promote; "
+    "use a Workflow only for parallel fan-out, passing router-plan snapshot text in args. "
+    "opus-planner is for Sonnet main sessions and needs arbitration."
+)
 
 
 def _blank(value):
@@ -75,6 +80,7 @@ def _context_text(mode, reads_routed):
     if mode == "task-aware":
         sentences.append(_DOC_TASK)
         sentences.append(_ARBITRATION_TASK)
+        sentences.append(_PLANNING_TASK)
         if reads_routed:
             sentences.append(_READ_TASK)
             sentences.append(_SAFE_READ)

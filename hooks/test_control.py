@@ -1092,12 +1092,15 @@ def test_opus_arbitration_paths(suite: Suite):
         _write(ledger, "runtime\n")
         judge = home / ".claude" / "agents" / "opus-judge.md"
         _write(judge, "---\nmodel: opus\n---\n")
+        planner = home / ".claude" / "agents" / "opus-planner.md"
+        _write(planner, "---\nmodel: opus\n---\n")
         mode = home / ".claude" / "opus-arbitration-mode"
         _write(mode, "active\n")
         hashes = hash_plane(home, proj)
         ledger_key = _norm(ledger)
         judge_key = _norm(judge)
         mode_key = _norm(mode)
+        planner_key = _norm(planner)
         entries = _paths.REGISTRY["control"]
         pattern = str(home) + "/.claude/logs/opus-arbitration/**"
         suite.check(
@@ -1105,10 +1108,13 @@ def test_opus_arbitration_paths(suite: Suite):
             "opus arbitration ledger is control but not hashed",
             "~/.claude/logs/opus-arbitration/**" in entries
             and "~/.claude/agents/opus-judge.md" in entries
+            and "~/.claude/agents/opus-planner.md" in entries
             and "~/.claude/opus-arbitration-mode" in entries
             and _paths.match(str(ledger), pattern)
             and ledger_key not in hashes
             and judge_key in hashes
+            and planner_key in hashes
+            and hashes.get(planner_key) not in (None, "absent")
             and mode_key in hashes,
             f"ledger={ledger_key in hashes} judge={judge_key in hashes} mode={mode_key in hashes}",
         )
