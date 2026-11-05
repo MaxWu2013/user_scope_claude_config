@@ -2,10 +2,12 @@
 """Guard workflow workers and surface their judge candidates on the main thread.
 
 The fast path imports only json, sys, and os. It returns immediately unless the
-payload is a workflow-subagent event, a pinned Opus role PreToolUse, or a
-main-thread PreToolUse whose session has a surface flag. Worker PreToolUse
-failures deny. Start and Stop never block. The opus-judge and opus-planner
-roles may use Read and no other tool.
+payload is a workflow worker event, a pinned Opus role PreToolUse, or a
+main-thread PreToolUse whose session has a surface flag. A worker is a
+workflow-subagent, or any other agent type whose transcript or spawn log shows
+a workflow run. Worker PreToolUse failures deny. Start and Stop never block.
+The opus-judge and opus-planner roles may use Read and no other tool, and that
+deny still applies when one of those roles is also a workflow worker.
 """
 
 import json
@@ -13,6 +15,15 @@ import os
 import sys
 
 _DELEGATION = frozenset({"Agent", "Task", "SendMessage", "Workflow", "Skill"})
+_TRIVIAL_TOOLS = frozenset({
+    "Read",
+    "Grep",
+    "Glob",
+    "LS",
+    "WebFetch",
+    "WebSearch",
+    "NotebookRead",
+})
 
 
 def _safe_id(value):
@@ -127,11 +138,11 @@ def _policy_role_names():
 
 
 def _role_tool_result(data):
-    """0 when a pinned Opus role may use this tool, deny-code when it may not.
+    """'allow' for role Read, 'deny' when the role may not use the tool.
 
     None means the payload is not a PreToolUse from the judge or planner.
     Policy is read only on this branch. A missing or malformed policy uses
-    opus-judge and opus-planner.
+    opus-judge and opus-planner. A deny has already been written.
     """
     if not isinstance(data, dict) or data.get("hook_event_name") != "PreToolUse":
         return None
@@ -143,15 +154,93 @@ def _role_tool_result(data):
         return None
     tool = data.get("tool_name")
     if tool == "Read":
-        return 0
+        return "allow"
     shown = tool if isinstance(tool, str) else ""
-    return _deny("OPUS_ROLE_TOOL_DENIED %s" % shown)
+    _deny("OPUS_ROLE_TOOL_DENIED %s" % shown)
+    return "deny"
+
+
+def _ledger_db():
+    return os.path.join(os.path.expanduser("~"), ".claude", "logs", "opus-arbitration", "ledger.db")
+
+
+def _cached_workflow_worker(agent_id):
+    if not os.path.lexists(_ledger_db()):
+        return False
+    try:
+        _agent_model, arb = _modules()
+        row = arb.workflow_worker_row(agent_id)
+    except Exception:
+        return False
+    return isinstance(row, dict) and row.get("kind") == "workflow_worker"
+
+
+def _remember_worker(data):
+    try:
+        _agent_model, arb = _modules()
+        arb.record_workflow_worker(data)
+    except Exception:
+        return
+
+
+def _custom_worker(data):
+    """True when a non-workflow-subagent payload is still a workflow worker.
+
+    SubagentStart and SubagentStop always look. A PreToolUse looks at the
+    ledger cache, and looks at the transcript and spawn log only when the
+    tool is not trivially safe. The positive result is cached as
+    agent_runs.kind workflow_worker.
+    """
+    if not isinstance(data, dict) or data.get("agent_type") == "workflow-subagent":
+        return False
+    if not _has_agent(data):
+        return False
+    agent_id = data.get("agent_id").strip()
+    memo = getattr(_custom_worker, "memo", None)
+    if memo is None:
+        memo = {}
+        _custom_worker.memo = memo
+    if agent_id in memo:
+        return memo[agent_id]
+    event = data.get("hook_event_name")
+    tool = data.get("tool_name")
+    tool_name = tool.strip() if isinstance(tool, str) else ""
+    if event in ("SubagentStart", "SubagentStop"):
+        probe = True
+    elif event == "PreToolUse":
+        probe = tool_name not in _TRIVIAL_TOOLS
+    else:
+        memo[agent_id] = False
+        return False
+    if _cached_workflow_worker(agent_id):
+        memo[agent_id] = True
+        return True
+    if not probe:
+        memo[agent_id] = False
+        return False
+    try:
+        agent_model, _arb = _modules()
+        found = bool(agent_model.workflow_worker_evidence(data))
+    except Exception:
+        found = False
+    if found:
+        _remember_worker(data)
+    memo[agent_id] = found
+    return found
+
+
+def _worker_payload(data):
+    if not isinstance(data, dict):
+        return False
+    if data.get("agent_type") == "workflow-subagent":
+        return True
+    return _custom_worker(data)
 
 
 def _interesting(data):
     if not isinstance(data, dict):
         return False
-    if data.get("agent_type") == "workflow-subagent":
+    if _worker_payload(data):
         return True
     if data.get("hook_event_name") != "PreToolUse" or _has_agent(data):
         return False
@@ -356,7 +445,7 @@ def _surface(arb, data):
 
 def _handle(data):
     agent_model, arb = _modules()
-    if data.get("agent_type") == "workflow-subagent":
+    if _worker_payload(data):
         event = data.get("hook_event_name")
         if event == "SubagentStart":
             return _start(arb, data)
@@ -374,18 +463,29 @@ def main():
         if "workflow-subagent" in raw:
             return 2
         return 0
-    if isinstance(data, dict):
-        role = _role_tool_result(data)
-        if role is not None:
-            return role
     if isinstance(data, dict) and _main_workflow(data):
         _write_guard_attest(data)
+    worker = _worker_payload(data) if isinstance(data, dict) else False
+    if worker and data.get("hook_event_name") == "PreToolUse":
+        tool = data.get("tool_name")
+        if isinstance(tool, str) and tool.strip() in _DELEGATION:
+            try:
+                _agent_model, arb = _modules()
+                return _deny(arb.WORKER_NO_DELEGATION)
+            except Exception:
+                return _deny("WORKFLOW_GUARD_ERROR")
+    if isinstance(data, dict):
+        role = _role_tool_result(data)
+        if role == "deny":
+            return 0
+        if role == "allow" and not worker:
+            return 0
     if not _interesting(data):
         return 0
     try:
         return _handle(data)
     except Exception:
-        if isinstance(data, dict) and data.get("agent_type") == "workflow-subagent":
+        if isinstance(data, dict) and _worker_payload(data):
             event = data.get("hook_event_name")
             if event in ("SubagentStart", "SubagentStop"):
                 return 0

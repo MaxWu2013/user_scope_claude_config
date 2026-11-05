@@ -1716,22 +1716,31 @@ def load_arbitration(session_id: str, agents: dict[str, dict], config=None) -> d
             costs["main"] += amount
             continue
         kind = kinds.get(agent.get("id"))
+        under_workflow = isinstance(agent.get("workflow_run"), str) and agent.get("workflow_run") != ""
         if kind == "judge":
             bucket = "judge"
         elif kind == "escalated":
             bucket = "escalated_opus"
         elif kind == "planner":
             bucket = "planner"
-        elif kind == "routine":
-            bucket = "routine"
-        elif kind == "workflow_worker":
+        elif under_workflow or kind == "workflow_worker":
             bucket = "workflow_worker"
             model_name = _actual_model(agent)
             workflow_workers[model_name] = workflow_workers.get(model_name, 0) + 1
+            agent_type = agent.get("agentType")
+            if not isinstance(agent_type, str) or agent_type == "":
+                agent_type = "unknown"
+            if agent_type != "workflow-subagent":
+                coverage_warnings.append(
+                    "coverage_warning: workflow_worker_custom_type %s %s"
+                    % (agent.get("id"), agent_type)
+                )
             if _agent_uses_opus(agent):
                 coverage_warnings.append(
                     "coverage_warning: unarbitrated_opus_agent %s" % agent.get("id")
                 )
+        elif kind == "routine":
+            bucket = "routine"
         else:
             bucket = "unclassified"
             if _agent_uses_opus(agent):

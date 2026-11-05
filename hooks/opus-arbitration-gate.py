@@ -249,7 +249,7 @@ def _router_stage_gate(tool_input):
 
 
 def _stage_deny_text(stage, code):
-    if code in ("ROUTER_PLAN_STALE", "ROUTER_STAGE_DUPLICATE", "ROUTER_STAGE_UNKNOWN"):
+    if code in ("ROUTER_PLAN_MISSING", "ROUTER_PLAN_STALE", "ROUTER_STAGE_DUPLICATE", "ROUTER_STAGE_UNKNOWN"):
         return "%s; run router-plan show %s" % (code, stage["task_id"])
     return code or "ROUTER_STAGE_INVALID"
 
@@ -647,13 +647,40 @@ def _agent(data, proved):
     return _deny_agent(data, reason)
 
 
+def _custom_workflow_worker(data):
+    """A worker started with some agent type other than workflow-subagent."""
+    agent_id = data.get("agent_id")
+    if not isinstance(agent_id, str) or agent_id.strip() == "":
+        return False
+    agent_id = agent_id.strip()
+    try:
+        if os.path.lexists(arb.ledger_path()):
+            row = arb.workflow_worker_row(agent_id)
+            if isinstance(row, dict) and row.get("kind") == "workflow_worker":
+                return True
+    except Exception:
+        pass
+    try:
+        found = _agent_model.workflow_worker_evidence(data)
+    except Exception:
+        return False
+    if found:
+        try:
+            arb.record_workflow_worker(data)
+        except Exception:
+            pass
+    return bool(found)
+
+
 def _handle(data, proved):
     tool = data.get("tool_name")
     if not isinstance(tool, str):
         proved["non_opus"] = True
         return 0
     tool = tool.strip()
-    if data.get("agent_type") == "workflow-subagent" and tool in ("Agent", "Task", "SendMessage", "Workflow"):
+    if tool in ("Agent", "Task", "SendMessage", "Workflow") and (
+        data.get("agent_type") == "workflow-subagent" or _custom_workflow_worker(data)
+    ):
         return _deny_agent(data, arb.WORKER_NO_DELEGATION)
     if tool == "SendMessage":
         return _send_message(data, proved)

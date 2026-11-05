@@ -3650,7 +3650,8 @@ def test_plan_ledger(suite):
             and "stages open:" in status.stdout
             and request_id in status.stdout
             and "from_state=CANDIDATE" in status.stdout
-            and "stage=draft" in status.stdout,
+            and "stage=draft" in status.stdout
+            and "plan_version=1" in status.stdout,
             status.stdout[-500:],
         )
         cancel = register("sess-cancel", "cancel-task")
@@ -3710,6 +3711,7 @@ def test_planner(suite):
     world = World()
     try:
         before = rows(world, "requests")
+        _set_planning(world, False)
         kind, reason = verdict(run_gate(world, _planner_call(
             world, session_id="sess-p1", tool_use_id="p1",
         )))
@@ -3743,6 +3745,70 @@ def test_planner(suite):
             kind == "deny" and reason.startswith("OPUS_PLANNER_NOT_NEEDED ")
             and not any(row["session_id"] == "sess-p2b" for row in rows(world, "requests")),
             reason[:240],
+        )
+        early = world.home / ".claude" / "projects" / "demo" / "early-opus.jsonl"
+        early.write_text(
+            json.dumps({
+                "type": "attachment",
+                "attachment": {
+                    "type": "model",
+                    "identity": {"modelId": "claude-opus-5-5", "marketingName": "Opus"},
+                },
+            }) + "\n",
+            encoding="utf-8",
+        )
+        early_family = _agent_model.main_session_model({"transcript_path": str(early)})
+        kind, reason = verdict(run_gate(world, _planner_call(
+            world, session_id="sess-early", tool_use_id="p-early", transcript=early,
+        )))
+        suite.check(
+            "P2",
+            "a session-start model attachment is enough for NOT_NEEDED",
+            early_family == "opus"
+            and kind == "deny" and reason.startswith("OPUS_PLANNER_NOT_NEEDED ")
+            and not any(row["session_id"] == "sess-early" for row in rows(world, "requests")),
+            "family=%s reason=%s" % (early_family, reason[:200]),
+        )
+        quoted = world.home / ".claude" / "projects" / "demo" / "quoted-model.jsonl"
+        quoted.write_text(
+            json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": "The exact model ID is claude-opus-5-5"},
+            }) + "\n",
+            encoding="utf-8",
+        )
+        empty = world.home / ".claude" / "projects" / "demo" / "empty-main.jsonl"
+        empty.write_text("{}\n", encoding="utf-8")
+        quoted_family = _agent_model.main_session_model({"transcript_path": str(quoted)})
+        empty_family = _agent_model.main_session_model({"transcript_path": str(empty)})
+        kind, reason = verdict(run_gate(world, _planner_call(
+            world, session_id="sess-unknown", tool_use_id="p-unknown", transcript=empty,
+        )))
+        suite.check(
+            "P2",
+            "unknown stays unknown and still asks for arbitration",
+            quoted_family == "unknown" and empty_family == "unknown"
+            and kind == "deny" and "ARBITRATION_REQUIRED" in reason
+            and "OPUS_PLANNER_NOT_NEEDED" not in reason,
+            "quoted=%s empty=%s reason=%s" % (quoted_family, empty_family, reason[:200]),
+        )
+        mixed = world.home / ".claude" / "projects" / "demo" / "mixed-model.jsonl"
+        mixed.write_text(
+            json.dumps({
+                "type": "attachment",
+                "attachment": {"type": "model", "identity": {"modelId": "claude-opus-5-5"}},
+            }) + "\n"
+            + json.dumps({
+                "type": "assistant",
+                "message": {"role": "assistant", "model": "claude-sonnet-5-5", "content": [{"type": "text", "text": "ok"}]},
+            }) + "\n",
+            encoding="utf-8",
+        )
+        suite.check(
+            "P2",
+            "a later assistant model wins over the session-start identity",
+            _agent_model.main_session_model({"transcript_path": str(mixed)}) == "sonnet",
+            _agent_model.main_session_model({"transcript_path": str(mixed)}),
         )
         kind, reason = verdict(run_gate(world, _planner_call(
             world, session_id="sess-p3", tool_use_id="p3", prompt="ROUTER-TASK plan-1\nPlan the store",
@@ -4466,9 +4532,9 @@ def test_replan(suite):
         )
         suite.check(
             "R9",
-            "a yielded stage stays put and the new version can start",
-            dup_ok is False and dup_code == "ROUTER_STAGE_DUPLICATE"
-            and old_rows and old_rows[0]["status"] == "needs_judgment"
+            "a promoted plan cancels the yielded stage and the new version can start",
+            dup_ok is False and dup_code == "ROUTER_PLAN_STALE"
+            and old_rows and old_rows[0]["status"] == "cancelled"
             and fresh_kind == "allow"
             and fresh_rows and fresh_rows[0]["status"] == "started"
             and fresh_rows[0]["plan_version"] == version + 1
@@ -4887,7 +4953,7 @@ def test_wp3b(suite):
             and events.count("replan_uncorrelated") >= 2
             and "REPLAN_REQUEST" not in kinds_for(old)
             and "EXECUTOR_ESCALATION" in kinds_for(old)
-            and old_stage and old_stage[0]["status"] == "started"
+            and old_stage and old_stage[0]["status"] == "cancelled"
             and old_stage[0]["plan_version"] == old_version,
             "kinds=%s status=%s version=%s" % (
                 kinds_for(old),

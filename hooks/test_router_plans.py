@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -316,6 +317,14 @@ def test_stages(suite, home):
         "sess-stage", replan_id, first["version"], first["content_sha256"], first["scope_digest"],
     )
     started_ok, _started_code, started_attempt = arb.stage_start("sess-stage", replan_id, 1, "draft")
+    review_ok, _review_code, _review_attempt = arb.stage_start("sess-stage", replan_id, 1, "review")
+    judged = sqlite3.connect(arb.ledger_path())
+    judged.execute(
+        "UPDATE stages SET status='needs_judgment' WHERE task_id=? AND stage_id='review'",
+        (replan_id,),
+    )
+    judged.commit()
+    judged.close()
     second = plans.promote(replan_id, copy.deepcopy(plan_for(replan_id, base=1, steps=replan_steps)))
     arb.record_plan_version(
         "sess-stage", replan_id, second["version"], second["content_sha256"], second["scope_digest"],
@@ -337,6 +346,27 @@ def test_stages(suite, home):
         "a never-started v1 stage is stale after v2 is active",
         never_ok is False and never_code == "ROUTER_PLAN_STALE",
         never_code,
+    )
+    superseded = {
+        row.get("stage_id"): row.get("status")
+        for row in arb.task_stages(replan_id)
+        if row.get("plan_version") == 1
+    }
+    events_path = Path(home) / ".claude" / "logs" / "opus-arbitration" / "events.jsonl"
+    events_text = events_path.read_text(encoding="utf-8") if events_path.exists() else ""
+    missing_plan, missing_code = arb.stage_check("no-plan-task", 1, "draft")
+    shown = _run_cli(home, ["show", replan_id])
+    suite.check(
+        "3",
+        "promote cancels older open stages and a missing plan is not stale",
+        review_ok
+        and superseded.get("draft") == "cancelled"
+        and superseded.get("review") == "cancelled"
+        and events_text.count("stage_superseded") >= 2
+        and missing_plan is False and missing_code == "ROUTER_PLAN_MISSING"
+        and "plan_version=1" in shown.stdout
+        and "plan_version=2" in shown.stdout,
+        "status=%s code=%s show=%s" % (superseded, missing_code, shown.stdout[-240:]),
     )
     results = _race(home, "stage", {"task_id": task_id, "version": 1, "stage_id": "parallel"})
     suite.check(
@@ -374,6 +404,25 @@ def test_cli(suite, home):
     inside.write_text(json.dumps(plan_for("cli-task")), encoding="utf-8")
     promoted = _run_cli(home, ["promote", "cli-task", str(inside)])
     promoted_body = _last_json(promoted.stdout) if promoted.returncode == 0 else {}
+    missing_draft = _run_cli(home, ["promote", "cli-task", str(drafts / "missing.json")])
+    unread_dir = drafts / "unread.json"
+    unread_dir.mkdir()
+    unread = _run_cli(home, ["promote", "cli-task", str(unread_dir)])
+    usage = _run_cli(home, [])
+    suite.check(
+        "4",
+        "a missing draft is not a corrupt plan, and help names the headless allow rule",
+        missing_draft.returncode == 1
+        and _last_json(missing_draft.stdout).get("code") == "ROUTER_DRAFT_MISSING"
+        and "ROUTER_PLAN_CORRUPT" not in missing_draft.stdout
+        and unread.returncode == 1
+        and _last_json(unread.stdout).get("code") == "ROUTER_DRAFT_MISSING"
+        and usage.returncode == 2
+        and 'Write(<HOME>/.claude/plans/router/drafts/*)' in usage.stdout,
+        "missing=%s unread=%s usage=%r" % (
+            missing_draft.returncode, unread.returncode, usage.stdout[-240:],
+        ),
+    )
     suite.check(
         "4",
         "promote outside drafts is usage and inside drafts is ok",
@@ -383,6 +432,14 @@ def test_cli(suite, home):
         "refused=%s %r promoted=%s %r" % (
             refused.returncode, refused.stdout[-240:], promoted.returncode, promoted.stdout[-240:],
         ),
+    )
+    show_started, show_code, _show_attempt = arb.stage_start("sess-show", "cli-task", 1, "draft")
+    shown_cli = _run_cli(home, ["show", "cli-task"])
+    suite.check(
+        "4",
+        "show prints plan_version on every stage row",
+        show_started and show_code == "OK" and "stage=draft plan_version=1" in shown_cli.stdout,
+        shown_cli.stdout[-240:],
     )
     registered = arb.register_candidate(
         session_id="sess-cli",

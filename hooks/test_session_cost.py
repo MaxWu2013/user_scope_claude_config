@@ -1609,6 +1609,103 @@ def test_workflow_workers(tally: Tally):
     )
 
 
+def test_workflow_worker_custom_type(tally: Tally):
+    """A workflow transcript is a workflow_worker even when its type is custom.
+
+    judge, planner, and escalated ledger rows stay in those buckets. The meta
+    shape is the live opus-planner worker, with the prompt text left out.
+    """
+    root = Path(tempfile.mkdtemp(prefix="session-cost-custom-"))
+    home = root / "home"
+    home.mkdir()
+    projects = root / "projects"
+    stub = root / "ccusage"
+    payload = root / "payload.json"
+    prices = root / "prices.json"
+    stub_script(stub)
+    pricing_file(prices)
+    session = projects / "proj" / SID
+    run_id = "wf_8631071d-2c9"
+    workers = session / "subagents" / "workflows" / run_id
+    write_jsonl(
+        projects / "proj" / f"{SID}.jsonl",
+        [assistant("msg-main", "claude-opus-5-5", "2026-06-03T00:00:00.000Z", usage(10, 0), [{"type": "text", "text": "main"}], "req-main")],
+    )
+    specs = (
+        ("custom", "opus-planner", "claude-sonnet-5-5", 20, 2.0, "2026-06-03T00:01:00.000Z"),
+        ("plain", None, "claude-sonnet-5-5", 15, 1.5, "2026-06-03T00:01:30.000Z"),
+        ("judgeone", "opus-judge", "claude-opus-5-5", 40, 4.0, "2026-06-03T00:02:00.000Z"),
+        ("planone", "opus-planner", "claude-opus-5-5", 10, 1.0, "2026-06-03T00:03:00.000Z"),
+        ("escone", "general-purpose", "claude-opus-5-5", 30, 3.0, "2026-06-03T00:04:00.000Z"),
+    )
+    entries = [entry("2026-06-03T00:00:00.000Z", "claude-opus-5-5", 10, 0, 1.0)]
+    for agent_id, agent_type, model, tokens, cost, timestamp in specs:
+        write_jsonl(
+            workers / f"agent-{agent_id}.jsonl",
+            [
+                {
+                    "type": "attachment",
+                    "attachment": {"type": "model", "identity": {"modelId": model, "marketingName": model}},
+                },
+                assistant(f"msg-{agent_id}", model, timestamp, usage(tokens, 0), [{"type": "text", "text": agent_id}], f"req-{agent_id}"),
+            ],
+        )
+        if agent_type:
+            (workers / f"agent-{agent_id}.meta.json").write_text(
+                json.dumps({
+                    "agentType": agent_type,
+                    "isBuiltIn": False,
+                    "description": "C",
+                    "model": "sonnet",
+                }),
+                encoding="utf-8",
+            )
+        entries.append(entry(timestamp, model, tokens, 0, cost))
+    ccusage_payload(payload, entries, 12.5, 125)
+    ledger = root / "ledger.db"
+    conn = sqlite3.connect(ledger)
+    conn.executescript(
+        """
+        CREATE TABLE requests (request_id TEXT, session_id TEXT, decision TEXT, state TEXT);
+        CREATE TABLE grants (grant_id TEXT, session_id TEXT, consumed_tool_use_id TEXT, expires REAL);
+        CREATE TABLE agent_runs (agent_id TEXT, session_id TEXT, kind TEXT);
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY, ts TEXT, session_id TEXT, event TEXT, request_id TEXT, detail_json TEXT
+        );
+        """
+    )
+    conn.executemany(
+        "INSERT INTO agent_runs VALUES (?,?,?)",
+        (("judgeone", SID, "judge"), ("planone", SID, "planner"), ("escone", SID, "escalated")),
+    )
+    conn.commit()
+    conn.close()
+    config = base_config(projects, home, stub, prices)
+    config["ledger_path"] = str(ledger)
+    report = json.loads(run([SID, "--json"], config, stub_env(payload)).stdout)
+    human = run([SID], config, stub_env(payload))
+    arb = report.get("arbitration") or {}
+    costs = arb.get("costs") or {}
+    warnings = arb.get("coverage_warnings") or []
+    custom_cost = agent_by_id(report, "custom")["executor"]["cost"]
+    plain_cost = agent_by_id(report, "plain")["executor"]["cost"]
+    tally.check(
+        "a custom workflow type is a workflow_worker and stays visible",
+        costs.get("workflow_worker") == custom_cost + plain_cost
+        and costs.get("judge") == agent_by_id(report, "judgeone")["executor"]["cost"]
+        and costs.get("planner") == agent_by_id(report, "planone")["executor"]["cost"]
+        and costs.get("escalated_opus") == agent_by_id(report, "escone")["executor"]["cost"]
+        and arb.get("workflow_workers") == {"claude-sonnet-5-5": 2}
+        and "coverage_warning: workflow_worker_custom_type custom opus-planner" in warnings
+        and not any("workflow_worker_custom_type plain" in item for item in warnings)
+        and not any("workflow_worker_custom_type judgeone" in item for item in warnings)
+        and not any("workflow_worker_custom_type planone" in item for item in warnings)
+        and not any("workflow_worker_custom_type escone" in item for item in warnings)
+        and "workflow_worker_custom_type custom opus-planner" in human.stdout,
+        "costs=%s workers=%s warnings=%s" % (costs, arb.get("workflow_workers"), warnings),
+    )
+
+
 def main():
     tally = Tally()
     test_core(tally)
@@ -1624,6 +1721,7 @@ def main():
     test_scaled_cost(tally)
     test_arbitration_ledger(tally)
     test_workflow_workers(tally)
+    test_workflow_worker_custom_type(tally)
     return tally.finish()
 
 

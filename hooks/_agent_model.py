@@ -563,15 +563,67 @@ def _last_assistant_model(path):
     return None
 
 
+def _session_identity_model(path):
+    """identity.modelId from the head of a transcript, else None.
+
+    Claude Code writes this attachment at session start, before the first
+    assistant line is flushed. A quoted "exact model ID" sentence is not
+    that attachment and is not a model.
+    """
+    real = _transcript_file(path)
+    if real is None:
+        return None
+    try:
+        info = os.lstat(real)
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    try:
+        fd = os.open(real, _read_flags() | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        try:
+            blob = os.read(fd, _TRANSCRIPT_CAP)
+        except OSError:
+            return None
+    finally:
+        os.close(fd)
+    text = bytes(blob).decode("utf-8", errors="replace")
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "" or stripped[0] != "{":
+            continue
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        model_id = _identity_model_id(obj)
+        if model_id:
+            return model_id
+    return None
+
+
+def _raw_main_model(payload):
+    """Last complete assistant model, else the session-start identity."""
+    if not isinstance(payload, dict):
+        return None
+    path = payload.get("transcript_path")
+    raw = _last_complete_assistant_model(path)
+    if raw is not None:
+        return raw
+    return _session_identity_model(path)
+
+
 def main_session_model(payload):
     """opus, sonnet, haiku, or unknown from the main transcript.
 
     Any failure, including a model id that is not one of those families, is
-    unknown. Reads at most the last 2 MiB, and only a complete assistant line.
+    unknown. The last complete assistant line wins. Before that line exists,
+    the session-start identity.modelId is the model. Unknown stays unknown.
     """
-    if not isinstance(payload, dict):
-        return "unknown"
-    raw = _last_complete_assistant_model(payload.get("transcript_path"))
+    raw = _raw_main_model(payload)
     if raw is None:
         return "unknown"
     family = _model_family(raw)
@@ -581,10 +633,8 @@ def main_session_model(payload):
 
 
 def main_session_model_id(payload):
-    """Raw assistant model id, or unknown when it cannot be read."""
-    if not isinstance(payload, dict):
-        return "unknown"
-    raw = _last_complete_assistant_model(payload.get("transcript_path"))
+    """Raw assistant model id, or the session-start identity, else unknown."""
+    raw = _raw_main_model(payload)
     if raw is None:
         return "unknown"
     family = _model_family(raw)
@@ -1138,6 +1188,90 @@ def find_workflow_transcript(transcript_path, session_id, agent_id):
         if stat.S_ISREG(info.st_mode):
             found = path
     return found
+
+
+def _workflow_agent_path(path, session_id, agent_id):
+    """True when path is <session>/subagents/workflows/<runId>/agent-<id>.jsonl."""
+    session_id = _safe_path_id(session_id)
+    agent_id = _safe_path_id(agent_id)
+    if session_id is None or agent_id is None or not isinstance(path, str) or path.strip() == "":
+        return False
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    parts = os.path.normpath(path).split(os.sep)
+    if len(parts) < 5 or parts[-1] != "agent-%s.jsonl" % agent_id:
+        return False
+    run_id = parts[-2]
+    if run_id in ("", ".", "..") or parts[-3] != "workflows" or parts[-4] != "subagents":
+        return False
+    if parts[-5] != session_id:
+        return False
+    return True
+
+
+def _spawn_log_workflow_run(session_id, agent_id):
+    """True when the mod spawn log names this agent on a workflow run."""
+    session_id = _safe_path_id(session_id)
+    agent_id = _safe_path_id(agent_id)
+    if session_id is None or agent_id is None:
+        return False
+    path = os.path.join(
+        os.path.expanduser("~"),
+        ".claude",
+        "logs",
+        "opus-arbitration",
+        "mod",
+        "spawns-%s.jsonl" % session_id,
+    )
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                text = line.strip()
+                if text == "":
+                    continue
+                try:
+                    row = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict) or row.get("agentId") != agent_id:
+                    continue
+                run_id = row.get("runId")
+                if isinstance(run_id, str) and run_id.strip() != "":
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def workflow_worker_evidence(payload):
+    """True when the transcript location or the spawn log shows a workflow worker.
+
+    The agent_type workflow-subagent fast path is the caller's. This is the
+    extra evidence for a worker that was started with some other agent type.
+    """
+    if not isinstance(payload, dict):
+        return False
+    agent_id = payload.get("agent_id")
+    if not isinstance(agent_id, str) or agent_id.strip() == "":
+        return False
+    agent_id = agent_id.strip()
+    session_id = payload.get("session_id")
+    if _workflow_agent_path(payload.get("agent_transcript_path"), session_id, agent_id):
+        return True
+    found = find_workflow_transcript(payload.get("transcript_path"), session_id, agent_id)
+    if isinstance(found, str) and found != "":
+        return True
+    return _spawn_log_workflow_run(session_id, agent_id)
 
 
 def _identity_model_id(obj):

@@ -620,8 +620,28 @@ def _usage():
         "| close <request_id> --reason <text>",
         flush=True,
     )
+    print(
+        'headless sessions need --allowedTools "Write(<HOME>/.claude/plans/router/drafts/*)" '
+        "or a matching permission rule.",
+        flush=True,
+    )
     # Usage is a stdout line so the JSON object stays last. The human line is the usage.
     return _emit(False, "USAGE", 2)
+
+
+def _read_promote_draft(path):
+    """Draft JSON for promote. A missing or unreadable file is ROUTER_DRAFT_MISSING."""
+    try:
+        blob = _read_bytes(path, missing_ok=False)
+    except PlanStoreError as exc:
+        if exc.code == "ROUTER_PLAN_CORRUPT":
+            raise PlanStoreError("ROUTER_DRAFT_MISSING") from exc
+        raise
+    try:
+        data = json.loads(blob.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise PlanError("PLAN_INVALID") from exc
+    return data
 
 
 def _read_plan_file(path):
@@ -687,7 +707,7 @@ def _cmd_promote(args):
     if target is None:
         print("router-plan: draft must live under plans/router/drafts")
         return _emit(False, "ROUTER_DRAFT_LOCATION", 2)
-    data = _read_plan_file(target)
+    data = _read_promote_draft(target)
     arb, config = _planning_limits()
     record = promote(
         task_id,
@@ -748,8 +768,14 @@ def _cmd_show(task_id):
         print("  (none)")
     for row in stages:
         print(
-            "  stage=%s attempt=%s status=%s session=%s"
-            % (row.get("stage_id"), row.get("attempt"), row.get("status"), row.get("session_id") or "")
+            "  stage=%s plan_version=%s attempt=%s status=%s session=%s"
+            % (
+                row.get("stage_id"),
+                row.get("plan_version") if row.get("plan_version") is not None else "",
+                row.get("attempt"),
+                row.get("status"),
+                row.get("session_id") or "",
+            )
         )
     return _emit(
         True,

@@ -3139,6 +3139,32 @@ def record_plan_version(session_id, task_id, version, content_sha256, scope_dige
                    ) VALUES (?,?,?,?, 'active', ?, ?)""",
                 (task_id, version, content_sha256, scope_digest, session_id, now),
             )
+            open_rows = conn.execute(
+                """SELECT stage_id, plan_version, attempt FROM stages
+                   WHERE task_id=? AND plan_version < ?
+                     AND status IN ('started', 'needs_judgment')""",
+                (task_id, version),
+            ).fetchall()
+            if open_rows:
+                conn.execute(
+                    """UPDATE stages SET status='cancelled', updated=?
+                       WHERE task_id=? AND plan_version < ?
+                         AND status IN ('started', 'needs_judgment')""",
+                    (now, task_id, version),
+                )
+                for row in open_rows:
+                    _event(
+                        conn,
+                        "stage_superseded",
+                        session_id=session_id,
+                        task_id=task_id,
+                        extra={
+                            "stage_id": row["stage_id"],
+                            "plan_version": row["plan_version"],
+                            "attempt": row["attempt"],
+                            "superseded_by": version,
+                        },
+                    )
 
 
 def active_plan_version(task_id):
@@ -3170,7 +3196,9 @@ def _stage_block(conn, task_id, plan_version, stage_id):
         "SELECT version FROM plans WHERE task_id=? AND status='active'",
         (task_id,),
     ).fetchone()
-    if active is None or active["version"] != plan_version:
+    if active is None:
+        return (False, "ROUTER_PLAN_MISSING", rows)
+    if active["version"] != plan_version:
         return (False, "ROUTER_PLAN_STALE", rows)
     return (True, "OK", rows)
 
@@ -3179,12 +3207,13 @@ def stage_check(task_id, plan_version, stage_id):
     """Read-only stage_start. Same deny codes, no insert and no sweep.
 
     The gate runs this before accept_workflow. stage_start is still the
-    atomic reservation and denies a race this pre-check missed. A missing
-    ledger has no active plan, so the result is ROUTER_PLAN_STALE and the
-    store is left uncreated.
+    atomic reservation and denies a race this pre-check missed. No plan at
+    all, including a missing ledger, is ROUTER_PLAN_MISSING. A plan that
+    exists at a different version is ROUTER_PLAN_STALE. The store is left
+    uncreated when the ledger is absent.
     """
     if not os.path.lexists(ledger_path()):
-        return (False, "ROUTER_PLAN_STALE")
+        return (False, "ROUTER_PLAN_MISSING")
     with _db() as conn:
         ok, code, _rows = _stage_block(conn, task_id, plan_version, stage_id)
         return (ok, code)
@@ -3806,12 +3835,18 @@ def format_replan_required(request):
     version = request.get("plan_version")
     stage = request.get("stage_id") if isinstance(request.get("stage_id"), str) else ""
     question = redact(request.get("unresolved_question") or "", 200)
+    if type(version) is int and version >= 1:
+        draft_stem = "%s-v%s" % (task, version + 1)
+        base_version = version
+    else:
+        draft_stem = "%s-v2" % task
+        base_version = version
     return (
         "REPLAN_REQUIRED request_id=%s task=%s plan_version=%s stage=%s question=%s. "
         "Revise the plan yourself (no judge needed): save it to ~/.claude/plans/router/drafts/%s.json "
         "with base_plan_version=%s, run router-plan promote %s <file> --resolves %s, "
         "then start a fresh Workflow stage only if the remaining work needs parallel fan-out."
-        % (request_id, task, version, stage, question, task, version, task, request_id)
+        % (request_id, task, version, stage, question, draft_stem, base_version, task, request_id)
     )
 
 

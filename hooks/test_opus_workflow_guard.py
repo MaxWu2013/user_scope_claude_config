@@ -111,7 +111,7 @@ def launch_workflow(world, session_id, prompt_id):
         raise AssertionError("workflow launch %s %s" % (kind, reason[:200]))
 
 
-def start_worker(world, session_id, agent_id, prompt_id, transcript, extra=None, log=True):
+def start_worker(world, session_id, agent_id, prompt_id, transcript, extra=None, log=True, agent_type=None):
     if log:
         write_spawn(world, session_id, agent_id)
     payload = load_workflow("20261105T043808.357244Z-SubagentStart-none.json")
@@ -120,6 +120,8 @@ def start_worker(world, session_id, agent_id, prompt_id, transcript, extra=None,
     payload["transcript_path"] = str(transcript)
     payload["agent_id"] = agent_id
     payload["prompt_id"] = prompt_id
+    if agent_type:
+        payload["agent_type"] = agent_type
     return run_guard(world, payload, extra)
 
 
@@ -540,9 +542,156 @@ def test_replan_surface(suite):
             "the guard surfaces one REPLAN_REQUIRED line",
             ready and stopped.returncode == 0
             and text.startswith("REPLAN_REQUIRED ")
-            and "drafts/%s.json" % task_id in text
+            and "drafts/%s-v%s.json" % (task_id, version + 1) in text
+            and "base_plan_version=%s" % version in text
+            and "drafts/%s.json" % task_id not in text
+            and "drafts/%s-v1.json" % task_id not in text
             and "router-plan promote %s" % task_id in text,
             text[:300],
+        )
+    finally:
+        world.close()
+
+
+def test_custom_workers(suite):
+    """Workers started as opus-planner or file-writer still take the worker rules.
+
+    The transcript shape matches the live session
+    subagents/workflows/<runId>/agent-<id>.jsonl, and the spawn row matches the
+    mod log (runId plus agentId). No live file is copied whole.
+    """
+    world = base.World()
+    try:
+        session_id = "sess-custom"
+        prompt_id = "prompt-custom"
+        launch_workflow(world, session_id, prompt_id)
+        planner_id = "a1f3c99f510efd946"
+        writer_id = "a8bf97572725c7685"
+        transcript, _planner_path = write_transcript(world, session_id, planner_id, "claude-sonnet-5-5")
+        write_transcript(world, session_id, writer_id, "claude-sonnet-5-5")
+        started_planner = start_worker(
+            world, session_id, planner_id, prompt_id, transcript, agent_type="opus-planner",
+        )
+        started_writer = start_worker(
+            world, session_id, writer_id, prompt_id, transcript, agent_type="file-writer",
+        )
+        runs = [
+            row for row in base.rows(world, "agent_runs")
+            if row.get("agent_id") in (planner_id, writer_id)
+        ]
+        suite.check(
+            "CW",
+            "custom-type workers are linked and counted",
+            started_planner.returncode == 0 and started_writer.returncode == 0
+            and len(runs) == 2
+            and all(row.get("kind") == "workflow_worker" and row.get("workflow_id") for row in runs),
+            "runs=%s" % [(row.get("agent_id"), row.get("kind"), row.get("workflow_id")) for row in runs],
+        )
+        denied = []
+        for agent_type, agent_id in (("opus-planner", planner_id), ("file-writer", writer_id)):
+            for tool in ("Agent", "Task", "Workflow", "Skill", "SendMessage"):
+                payload = worker_read(world, session_id, agent_id, transcript, prompt_id)
+                payload["agent_type"] = agent_type
+                payload["tool_name"] = tool
+                payload["tool_use_id"] = "%s-%s" % (agent_type, tool)
+                kind, reason = base.verdict(run_guard(world, payload))
+                if kind != "deny" or reason != DELEGATION:
+                    denied.append("%s %s %s %s" % (agent_type, tool, kind, reason[:80]))
+        suite.check(
+            "CW",
+            "custom-type workers cannot delegate",
+            denied == [],
+            "; ".join(denied),
+        )
+        sonnet_read = worker_read(world, session_id, planner_id, transcript, prompt_id)
+        sonnet_read["agent_type"] = "opus-planner"
+        sonnet_ok = run_guard(world, sonnet_read)
+        bash = worker_read(world, session_id, planner_id, transcript, prompt_id)
+        bash["agent_type"] = "opus-planner"
+        bash["tool_name"] = "Bash"
+        bash["tool_use_id"] = "planner-bash"
+        bash_kind, bash_reason = base.verdict(run_guard(world, bash))
+        suite.check(
+            "CW",
+            "an opus-planner worker is model-checked and still role-denied",
+            sonnet_ok.returncode == 0 and sonnet_ok.stdout == ""
+            and bash_kind == "deny" and bash_reason == "OPUS_ROLE_TOOL_DENIED Bash",
+            "read=%r bash=%s %s" % (sonnet_ok.stdout[:80], bash_kind, bash_reason[:120]),
+        )
+        opus_id = "a38ac8d2ba2cf33e8"
+        write_transcript(world, session_id, opus_id, "claude-opus-5-5")
+        start_worker(world, session_id, opus_id, prompt_id, transcript, agent_type="file-writer")
+        opus_read = worker_read(world, session_id, opus_id, transcript, prompt_id)
+        opus_read["agent_type"] = "file-writer"
+        opus_kind, opus_reason = base.verdict(run_guard(world, opus_read))
+        suite.check(
+            "CW",
+            "a file-writer worker model is checked",
+            opus_kind == "deny" and opus_reason == "WORKFLOW_WORKER_MODEL_DENIED model=claude-opus-5-5",
+            opus_reason[:200],
+        )
+        plain = _role_payload(world, "opus-planner", "Agent", "plain-planner", agent_id="a" + "9" * 16)
+        plain_kind, plain_reason = base.verdict(run_guard(world, plain))
+        suite.check(
+            "CW",
+            "an opus-planner outside a workflow stays a role deny",
+            plain_kind == "deny" and plain_reason == "OPUS_ROLE_TOOL_DENIED Agent",
+            plain_reason[:200],
+        )
+
+        cap_session = "sess-custom-cap"
+        launch_workflow(world, cap_session, prompt_id)
+        first_id = "a1234567890abcde8"
+        second_id = "a1234567890abcde9"
+        write_transcript(world, cap_session, first_id, "claude-sonnet-5-5")
+        write_transcript(world, cap_session, second_id, "claude-sonnet-5-5")
+        tight = {"CLAUDE_ROUTING_WORKFLOW_MAX_WORKERS": "1"}
+        start_worker(world, cap_session, first_id, prompt_id, transcript, tight, agent_type="file-writer")
+        start_worker(world, cap_session, second_id, prompt_id, transcript, tight, agent_type="opus-planner")
+        over_payload = worker_read(world, cap_session, second_id, transcript, prompt_id)
+        over_payload["agent_type"] = "opus-planner"
+        over = run_guard(world, over_payload, tight)
+        over_kind, over_reason = base.verdict(over)
+        suite.check(
+            "CW",
+            "a custom-type worker counts against the fan-out cap",
+            over_kind == "deny" and over_reason == "WORKFLOW_FANOUT_CAP",
+            over_reason[:200],
+        )
+
+        spawn_session = "sess-spawn-only"
+        spawn_id = "aeb15a49df5475d8d"
+        launch_workflow(world, spawn_session, prompt_id)
+        write_spawn(world, spawn_session, spawn_id)
+        spawn_call = worker_read(world, spawn_session, spawn_id, world.sonnet_transcript, prompt_id)
+        spawn_call["agent_type"] = "file-writer"
+        spawn_call["tool_name"] = "Agent"
+        spawn_call["tool_use_id"] = "spawn-only-agent"
+        spawn_kind, spawn_reason = base.verdict(run_guard(world, spawn_call))
+        suite.check(
+            "CW",
+            "a spawn-log workflow run is a worker",
+            spawn_kind == "deny" and spawn_reason == DELEGATION,
+            spawn_reason[:200],
+        )
+
+        path_session = "sess-path-only"
+        path_id = "a1234567890abcdf0"
+        _path_transcript, worker_path = write_transcript(world, path_session, path_id, "claude-sonnet-5-5")
+        other = world.home / ".claude" / "projects" / "demo" / "other" / "main.jsonl"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_text("{}\n", encoding="utf-8")
+        path_call = worker_read(world, path_session, path_id, other, prompt_id)
+        path_call["agent_type"] = "file-writer"
+        path_call["tool_name"] = "Task"
+        path_call["tool_use_id"] = "path-only-task"
+        path_call["agent_transcript_path"] = str(worker_path)
+        path_kind, path_reason = base.verdict(run_guard(world, path_call))
+        suite.check(
+            "CW",
+            "agent_transcript_path under workflows is a worker",
+            path_kind == "deny" and path_reason == DELEGATION,
+            path_reason[:200],
         )
     finally:
         world.close()
@@ -553,6 +702,7 @@ def main():
     test_guard(suite)
     test_role_tools(suite)
     test_replan_surface(suite)
+    test_custom_workers(suite)
     print("Tally: %s passed, %s failed" % (suite.passed, suite.failed))
     if suite.failures:
         print("\n".join(suite.failures))
