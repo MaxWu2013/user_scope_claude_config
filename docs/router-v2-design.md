@@ -162,6 +162,118 @@ Live probes on Claude Code 2.1.318 (2026-11-05), Opus main, process env `sonnet`
 
 **Claude Code refuses to resume Workflow workers from the main session** ("No transcript found"), so the mod's `WORKFLOW_RESUME_DENIED` is defense in depth and is unit-tested only.
 
+## v2.1: planning and replans
+
+Router v2.1 is live (2026-11-05). It is on `main` by fast-forward from branch `router-v2.1`. Commits: `a0f273a` (protocol, planning off), `0b93c6f` (judge and planner tool isolation), `9bb95fd` (planning enabled), `9d45b6d` (live-test fixes), `17dc7cf` (sweep on status/show and the rollback suite). Previous: `fd4cce0` (v2 activation).
+
+v2 stays as described above. v2.1 adds plans as data, a planning route, a Workflow yield and replan loop, follow-through, and two tool and command fixes.
+
+### Plans as data
+
+`hooks/_router_plans.py` validates plan schema v1.
+
+- Fields: `task_id`, `base_plan_version`, `objective`, `assumptions`, `invariants`, `steps`, `risks`, `handoff_notes`.
+- Step fields: `id`, `depends_on`, `executor_role`, `allowed_model`, `instructions`, `acceptance_checks`, `requires_user_approval`.
+- Ids are unique. No cycles. No dangling deps. At most 12 steps.
+- `workflow-subagent`, `file-reader` and `file-writer` steps use `sonnet` or `haiku`. `cursor-run` steps use `cursor`. `main` steps use `main`.
+- The model-family word "opus" and `cursor-agent -p` are rejected anywhere in a plan.
+
+Storage is `~/.claude/plans/router/<task_id>/v<N>.json`. A version is created with `O_EXCL`. The `current` pointer is replaced atomically. Each version keeps a sha256 and a scope digest. At most 3 versions exist per task. Drafts go in `~/.claude/plans/router/drafts/`.
+
+### `router-plan` CLI
+
+`~/.claude/hooks/bin/router-plan`, main session only, exact single-line form:
+
+```
+router-plan validate <file>
+router-plan promote <task> <file> [--resolves <request_id>]
+router-plan show
+router-plan snapshot
+router-plan stage start|finish
+router-plan close
+```
+
+A headless session needs the allow rule `Write(<HOME>/.claude/plans/router/drafts/*)`, because Claude Code treats `~/.claude` files as sensitive. The plan is never promoted by a hook. Only `promote` makes a version current.
+
+### State additions
+
+| Item | Addition |
+| --- | --- |
+| Tables | `plans`, `stages` |
+| `requests.candidate_type` | `EXECUTOR_ESCALATION`, `PLAN_REQUEST`, `REPLAN_REQUEST` |
+| `requests.plan_task_id` | Task the plan or replan belongs to |
+| `grants.purpose` | `EXECUTOR`, `PLAN_ONLY` |
+| States | `REPLAN_PENDING`, `REPLAN_RESOLVED` |
+
+`CANDIDATE` rows now expire after `limits.candidate_ttl_seconds` (1800). An expired `CANDIDATE`, `JUDGE_PENDING` or `REPLAN_PENDING` becomes `EXPIRED` with decision `NO_FOLLOW_THROUGH` and a `no_follow_through` event. `opus-arbitration status` and `show`, and `router-plan show`, sweep first. They list "unresolved (no follow-through, 7d)" and "stages open".
+
+### Planning route
+
+| Main model | Route |
+| --- | --- |
+| Opus | The main session plans itself. An `opus-planner` call is denied `OPUS_PLANNER_NOT_NEEDED`. |
+| Sonnet | An `opus-planner` call gives `ARBITRATION_REQUIRED` with `candidate_type` `PLAN_REQUEST`. The main session launches `opus-judge`. ESCALATE gives one `PLAN_ONLY` grant, usable only by the exact planner call. |
+
+Contracts:
+
+- The judge output schema is unchanged (9 keys). The capability comes from the controller's `candidate_type`, not from judge text.
+- The post hook validates planner output: `PLANNER_PLAN_VALID`, `PLANNER_PLAN_INVALID`, or `PLANNER_RESULT_REJECTED` for a wrong model. A planner result is never auto-promoted.
+
+`~/.claude/agents/opus-planner.md` is a new Opus agent in the control class.
+
+### Tool isolation for Opus roles
+
+Both `opus-judge` and `opus-planner` declare `tools: Read`. Finding: `tools: []` was treated as ALL tools, so the earlier "no tools" declaration on the judge was not isolation. Definition checks now require exactly `Read`. The worker guard denies every other tool for these two roles, `OPUS_ROLE_TOOL_DENIED`, fail closed.
+
+### Workflow yield and replan
+
+Worker footer schema v2 (v1 is still accepted) adds `plan_id`, `plan_version`, `stage_id`, `workflow_run_id`, `unresolved_question`, `completed_stage_ids`, `failed_requirement_ids` and `requested_action`. New reason codes: `PLAN_REQUIRED`, `PLAN_REVISION_REQUIRED`.
+
+A Workflow may carry `args.router_stage {task_id, plan_version, stage_id}`. The gate checks it and denies fail-closed with `ROUTER_PLAN_MISSING`, `ROUTER_PLAN_STALE`, `ROUTER_STAGE_DUPLICATE`, `ROUTER_STAGE_UNKNOWN`, `ROUTER_STAGE_INVALID` or `ROUTER_STAGE_BUSY`. Gate order for `router_stage`:
+
+1. The `router_stage` checks above run, and the literal-opus check also covers `args`, not only the script text.
+2. The stage is reserved last, only after all other preconditions have passed.
+
+So a stage-denied Workflow does not use a session slot, and a denied Workflow holds no stage.
+
+Replan:
+
+- A worker footer with `PLAN_REVISION_REQUIRED` is correlated only through controller tables (workflow, then stage).- Opus main: the request goes to `REPLAN_PENDING` and is surfaced as `REPLAN_REQUIRED`. There is no judge and no judge quota.
+- Sonnet main: the judge path. ESCALATE composes a `PLAN_ONLY` `opus-planner` call.
+- At most 2 replans per task.
+- Promoting a new version resolves the replan (`REPLAN_RESOLVED`) and cancels superseded open stages.
+- A worker's `COMPLETED` never completes a stage. Only `router-plan stage finish` does.
+- Workflow failure events do not reach the post hook, because `PostToolUseFailure` matches `Agent|Bash` only. A failed Workflow leaves its stage started. `status` marks it stale after 1 h.
+
+### Trust rules
+
+- Planner output is validated and never auto-promoted. Only `router-plan promote` makes a plan current.
+- The `PLAN_ONLY` capability comes from the controller's `candidate_type`, not from judge text.
+- Every exact-command allow (`safe-read`, `cursor-run`, `session-cost`, `router-plan`) rejects `\n` and `\r` and uses horizontal whitespace only. A newline could chain a second command. This closed an older gap in `safe-read` and `cursor-run`.
+- A Workflow worker with a custom `agentType` is detected by Workflow lineage: a transcript under `subagents/workflows/`, or the mod spawn log. It is no longer detected only by `agent_type` `workflow-subagent`. `session-cost` buckets it as `workflow_worker` with the coverage warning `workflow_worker_custom_type`. It also has a `planner` bucket.
+- The main model is read from the session-start model attachment, so the first tool call knows it.
+
+### Rollback
+
+- Narrow: set `planning.enabled` to `false`. The planner is refused, old `PLAN_ONLY` grants are unusable and replans are blocked. v2 is unchanged. Plan history is kept.
+- `opus-arbitration disable` also cancels pending `PLAN_REQUEST` and `REPLAN_PENDING` rows and unused `PLAN_ONLY` grants.
+- Full: `git -C ~/.claude revert` back to `fd4cce0`. Tested: the v2 suites pass, and v2 code reads a v2.1-migrated ledger and still denies Opus. Suite: `hooks/test_rollback_v21.py`.
+- Policy edits change the mod heartbeat hash, so open sessions must restart before Workflows work again.
+
+### Live evidence
+
+Throwaway dir `~/workplace/router-v21-live`, 2026-11-05. Tests: 18 suites, 1,768 passing in a sandbox HOME (one sandbox-only case in `test_require_cursor_agent.py` needs `~/.agents/cursor-agent.md`). New suites: `test_router_plans.py`, `test_rollback_v21.py`.
+
+| Case | What ran | Result |
+| --- | --- | --- |
+| T01 | Routine Sonnet Workflow (session `d7a8b0dd`) | No judge. |
+| T02/T07/T09 | Opus main plan v1, worker `PLAN_REVISION_REQUIRED` (session `924f90a5`) | `REPLAN_REQUIRED`. Re-dispatch gave `ROUTER_STAGE_DUPLICATE`. `promote v2 --resolves` gave a fresh stage. |
+| T03 | Sonnet main planner (session `26717236`) | Judge CONTINUE (`SONNET_PLANNING_SUFFICIENT`), no grant. |
+| T11 | Opus-pinned `agentType` in a Workflow (sessions `924f90a5`, `bb522851`) | Ran `claude-sonnet-5-5`. |
+| P2 | `opus-planner` under an Opus main (session `bb522851`) | `OPUS_PLANNER_NOT_NEEDED` on the first call. |
+| T24 | Orphan request `esc-995bd1748d3199fc` | Expired as `NO_FOLLOW_THROUGH`. |
+| T04 | Judge ESCALATE for the planner | Not observed live. Unit-tested only. |
+
 ## Policy
 
 ```json
@@ -178,6 +290,20 @@ Live probes on Claude Code 2.1.318 (2026-11-05), Opus main, process env `sonnet`
 ```
 
 `opus_main_mode` is `deny` or `pinned_env`. Anything else is `deny`.
+
+v2.1 adds these keys:
+
+```json
+"planning": {
+  "enabled": true,
+  "planner_agent_type": "opus-planner",
+  "max_plan_versions_per_task": 3,
+  "max_replans_per_task": 2,
+  "max_steps": 12
+}
+```
+
+and `limits.candidate_ttl_seconds: 1800`. `planning.enabled: false` is the narrow rollback (see v2.1: planning and replans). A policy edit changes the mod heartbeat hash, so open sessions must restart before Workflows work again.
 
 ## Evidence
 
