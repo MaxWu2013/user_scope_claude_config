@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+"""Print or switch Opus arbitration."""
+
+import os
+import sys
+
+sys.dont_write_bytecode = True
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+import _opus_arbitration as arb
+
+
+if __name__ == "__main__":
+    sys.exit(arb.cli_main(sys.argv))

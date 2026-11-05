@@ -1,0 +1,18 @@
+{
+  "session_id": "5a2a785b-bdf6-41e3-86d6-30ce76adf1c3",
+  "transcript_path": "/Users/wujincheng/.claude/projects/-private-tmp-router-v2-probe/5a2a785b-bdf6-41e3-86d6-30ce76adf1c3.jsonl",
+  "cwd": "/private/tmp/router-v2-probe",
+  "prompt_id": "7524fbd9-d0a2-46d4-876a-1a05c9d903f7",
+  "permission_mode": "default",
+  "agent_id": "a0e59bea057ba6de7",
+  "agent_type": "probe-notools",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "SubagentStop",
+  "stop_hook_active": false,
+  "agent_transcript_path": "/Users/wujincheng/.claude/projects/-private-tmp-router-v2-probe/5a2a785b-bdf6-41e3-86d6-30ce76adf1c3/subagents/agent-a0e59bea057ba6de7.jsonl",
+  "last_assistant_message": "{\"probe\":\"ok\",\"tools\":[]}",
+  "background_tasks": [],
+  "session_crons": []
+}

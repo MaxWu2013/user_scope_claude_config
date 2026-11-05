@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import _control
+import _paths
 
 CURSOR_RUN = ROOT / "bin" / "cursor-run"
 CONTROL_CHECK = ROOT / "bin" / "control-check"
@@ -1083,9 +1084,42 @@ def test_probe(suite: Suite):
         _rm(root)
 
 
+def test_opus_arbitration_paths(suite: Suite):
+    root = Path(os.path.realpath(tempfile.mkdtemp(prefix="p6a-opus-")))
+    try:
+        home, proj, _agent = make_world(root)
+        ledger = home / ".claude" / "logs" / "opus-arbitration" / "ledger.db"
+        _write(ledger, "runtime\n")
+        judge = home / ".claude" / "agents" / "opus-judge.md"
+        _write(judge, "---\nmodel: opus\n---\n")
+        mode = home / ".claude" / "opus-arbitration-mode"
+        _write(mode, "active\n")
+        hashes = hash_plane(home, proj)
+        ledger_key = _norm(ledger)
+        judge_key = _norm(judge)
+        mode_key = _norm(mode)
+        entries = _paths.REGISTRY["control"]
+        pattern = str(home) + "/.claude/logs/opus-arbitration/**"
+        suite.check(
+            "19",
+            "opus arbitration ledger is control but not hashed",
+            "~/.claude/logs/opus-arbitration/**" in entries
+            and "~/.claude/agents/opus-judge.md" in entries
+            and "~/.claude/opus-arbitration-mode" in entries
+            and _paths.match(str(ledger), pattern)
+            and ledger_key not in hashes
+            and judge_key in hashes
+            and mode_key in hashes,
+            f"ledger={ledger_key in hashes} judge={judge_key in hashes} mode={mode_key in hashes}",
+        )
+    finally:
+        _rm(root)
+
+
 def main() -> int:
     suite = Suite()
     test_hash(suite)
+    test_opus_arbitration_paths(suite)
     test_bad_specs(suite)
     test_runs(suite)
     test_control_check(suite)

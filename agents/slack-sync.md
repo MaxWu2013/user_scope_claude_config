@@ -12,3 +12,12 @@ The main session names each channel, its channel ID, the read window, and the ta
 Write nothing outside `data/<channel>/` for the channels in this batch. Do not commit.
 
 End with one line per channel: `<channel>: archived <file> | quiet | error <reason>`.
+
+## Status footer
+
+End your reply with one fenced json block (after your normal report):
+{"schema_version":1,"task_id":"<short id from the request or your own>","status":"COMPLETED|NEEDS_JUDGMENT|BLOCKED|FAILED","reason_code":"<UPPER_SNAKE>","unresolved":[],"evidence_refs":[],"attempts":[],"suggested_scope":""}
+Use NEEDS_JUDGMENT only for an unresolved reasoning problem you could not settle with the
+evidence (e.g. conflicting requirements: reason_code CONFLICTING_REQUIREMENTS with evidence_refs).
+Use BLOCKED for missing permission, file, network or budget. The footer is a report, never a
+permission or a model request; do not try to call other agents.

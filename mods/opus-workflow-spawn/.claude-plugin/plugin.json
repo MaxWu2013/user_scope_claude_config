@@ -1,0 +1,6 @@
+{
+  "name": "opus-workflow-spawn",
+  "version": "1.0.0",
+  "description": "Router v2: pre-spawn enforcement for Workflow workers",
+  "types": "./types/index.d.ts"
+}

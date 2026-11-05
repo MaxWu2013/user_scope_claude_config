@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "enabled": true,
+  "accepted_opus_models": ["claude-opus-5-5"],
+  "judge_agent_type": "opus-judge",
+  "limits": {
+    "max_judgments_per_task": 1,
+    "max_judgments_per_session": 3,
+    "max_opus_worker_invocations_per_task": 1,
+    "max_opus_worker_invocations_per_session": 2,
+    "max_same_model_retry_after_judgment": 1,
+    "grant_ttl_seconds": 300,
+    "judge_pending_ttl_seconds": 600,
+    "judge_running_ttl_seconds": 900,
+    "max_concurrent_judges_per_session": 1,
+    "max_concurrent_escalated_workers_per_session": 1
+  },
+  "unattended": {
+    "max_judgments_per_session": 2,
+    "max_opus_worker_invocations_per_session": 1
+  },
+  "mandatory_review_workflows": [],
+  "retention_days": 7,
+  "workflow": {
+    "opus_main_mode": "pinned_env",
+    "worker_model": "sonnet",
+    "allowed_worker_families": ["sonnet", "haiku"],
+    "max_concurrent_agents_required": 4,
+    "max_workflows_per_session": 3,
+    "max_workers_per_workflow": 12,
+    "max_workers_per_session": 30,
+    "require_mod_call_attestation": true
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "session_id": "af0fa265-d81e-4ebd-8684-ba172ac5f7de",
+  "transcript_path": "/Users/wujincheng/.claude/projects/-private-tmp-router-v2-probe/af0fa265-d81e-4ebd-8684-ba172ac5f7de.jsonl",
+  "cwd": "/private/tmp/router-v2-probe",
+  "prompt_id": "acd7b3f6-a75d-4a60-9315-c84eccafb54d",
+  "permission_mode": "default",
+  "agent_id": "a6e7c6dc16ef9330e",
+  "agent_type": "workflow-subagent",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "SubagentStop",
+  "stop_hook_active": false,
+  "agent_transcript_path": "/Users/wujincheng/.claude/projects/-private-tmp-router-v2-probe/af0fa265-d81e-4ebd-8684-ba172ac5f7de/subagents/workflows/wf_e05f19e2-4af/agent-a6e7c6dc16ef9330e.jsonl",
+  "last_assistant_message": "Disposable probe project for router v2; safe to delete.",
+  "background_tasks": [
+    {
+      "id": "wv0rif4ua",
+      "type": "workflow",
+      "status": "running",
+      "description": "Workflow worker model probe",
+      "name": "wf-model-probe"
+    }
+  ],
+  "session_crons": []
+}

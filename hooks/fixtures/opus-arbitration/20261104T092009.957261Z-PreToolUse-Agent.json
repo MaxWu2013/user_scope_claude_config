@@ -1,0 +1,18 @@
+{
+  "session_id": "bef888d9-7db7-4897-8464-7e03010224ce",
+  "transcript_path": "/Users/wujincheng/.claude/projects/-private-tmp-router-v2-probe/bef888d9-7db7-4897-8464-7e03010224ce.jsonl",
+  "cwd": "/private/tmp/router-v2-probe",
+  "prompt_id": "915598f8-e4b4-40c5-bf3f-21d8a99e9d08",
+  "permission_mode": "default",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Agent",
+  "tool_input": {
+    "description": "Run probe agent",
+    "prompt": "run probe",
+    "subagent_type": "probe-sonnet"
+  },
+  "tool_use_id": "toolu_019M2MTqygzhnNMmKqnTvdpJ"
+}

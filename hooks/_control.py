@@ -47,6 +47,13 @@ def _excluded(path: Path) -> bool:
             and parts[index + 1] == "specs"
         ):
             return True
+        if (
+            part == ".claude"
+            and index + 2 < len(parts)
+            and parts[index + 1] == "logs"
+            and parts[index + 2] == "opus-arbitration"
+        ):
+            return True
     return False
 
 

@@ -1,0 +1,26 @@
+{
+  "session_id": "5a2a785b-bdf6-41e3-86d6-30ce76adf1c3",
+  "transcript_path": "/Users/wujincheng/.claude/projects/-private-tmp-router-v2-probe/5a2a785b-bdf6-41e3-86d6-30ce76adf1c3.jsonl",
+  "cwd": "/private/tmp/router-v2-probe",
+  "prompt_id": "7524fbd9-d0a2-46d4-876a-1a05c9d903f7",
+  "permission_mode": "default",
+  "agent_id": "a85b8270033ee0078",
+  "agent_type": "probe-sonnet",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "SubagentStop",
+  "stop_hook_active": false,
+  "agent_transcript_path": "/Users/wujincheng/.claude/projects/-private-tmp-router-v2-probe/5a2a785b-bdf6-41e3-86d6-30ce76adf1c3/subagents/agent-a85b8270033ee0078.jsonl",
+  "last_assistant_message": "{\"probe\":\"ok\",\"tools\":[\"Bash\",\"Edit\",\"Read\",\"Skill\",\"ToolSearch\",\"Write\",\"mcp__firecrawl__firecrawl_scrape\",\"mcp__firecrawl__firecrawl_search\",\"mcp__claude_ai_Claude_Docs__batch\",\"mcp__claude_ai_Claude_Docs__guide\",\"mcp__claude_ai_Claude_Docs__update\"]}",
+  "background_tasks": [
+    {
+      "id": "a85b8270033ee0078",
+      "type": "subagent",
+      "status": "running",
+      "description": "Run sonnet probe background",
+      "agent_type": "probe-sonnet"
+    }
+  ],
+  "session_crons": []
+}

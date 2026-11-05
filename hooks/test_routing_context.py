@@ -33,17 +33,28 @@ READ_TASK = (
     "and larger reads, Grep, Glob, Bash reads and search go to file-reader."
 )
 SAFE_READ = "The file-reader searches with safe-read rg -e A -e B (no | or parentheses)."
+ARBITRATION_TASK = (
+    "Opus subagents need arbitration: if a hook replies ARBITRATION_REQUIRED or "
+    "ARBITRATION_CANDIDATE, launch the opus-judge agent in the foreground with the short "
+    "prompt the hook gives (ARBITRATION-PACKET request_id=…), then follow its "
+    "ARBITRATION_DECISION (CONTINUE/RETRY at most once/STOP without Opus; ESCALATE: issue "
+    "exactly the granted call). Never retry an Opus call directly, never launch opus-judge "
+    "without a packet, and never use background or nested Opus agents."
+)
+ARBITRATION_STRICT = "Opus subagents are denied in strict mode; use sonnet or haiku."
 
 
 def expected_text(mode, reads_routed):
     parts = [CODE_SENTENCE, STATE_SENTENCE]
     if mode == "task-aware":
         parts.append(DOC_TASK)
+        parts.append(ARBITRATION_TASK)
         if reads_routed:
             parts.append(READ_TASK)
             parts.append(SAFE_READ)
     else:
         parts.append(DOC_STRICT)
+        parts.append(ARBITRATION_STRICT)
         if reads_routed:
             parts.append(READ_STRICT)
             parts.append(SAFE_READ)
@@ -116,7 +127,7 @@ def main():
         and isinstance(parsed, dict)
         and parsed.get("hookSpecificOutput", {}).get("hookEventName") == "SessionStart"
         and isinstance(text, str)
-        and len(text) <= 900
+        and len(text) <= 1100
         and all(part in text for part in REQUIRED),
         f"exit={completed.returncode} stdout={completed.stdout!r} stderr={completed.stderr!r} parsed={parsed!r}",
     )
@@ -321,7 +332,7 @@ def text_cases(check):
                         and isinstance(parsed, dict)
                         and parsed.get("hookSpecificOutput", {}).get("hookEventName") == "SessionStart"
                         and got == expected
-                        and len(expected) <= 900,
+                        and len(expected) <= 1100,
                         f"stdout={completed.stdout!r} stderr={completed.stderr!r}",
                     )
         check(

@@ -1,0 +1,74 @@
+{
+  "session_id": "5a2a785b-bdf6-41e3-86d6-30ce76adf1c3",
+  "transcript_path": "/Users/wujincheng/.claude/projects/-private-tmp-router-v2-probe/5a2a785b-bdf6-41e3-86d6-30ce76adf1c3.jsonl",
+  "cwd": "/private/tmp/router-v2-probe",
+  "prompt_id": "7524fbd9-d0a2-46d4-876a-1a05c9d903f7",
+  "permission_mode": "default",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Agent",
+  "tool_input": {
+    "description": "Run sonnet probe",
+    "prompt": "run probe",
+    "subagent_type": "probe-sonnet",
+    "run_in_background": false
+  },
+  "tool_response": {
+    "status": "completed",
+    "prompt": "run probe",
+    "agentId": "a9a5e80c63142c42f",
+    "agentType": "probe-sonnet",
+    "harnessNoteCount": 0,
+    "harnessTailCount": 0,
+    "harnessSectionHash": "7c9f22043aa861d3",
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"probe\":\"ok\",\"tools\":[\"Bash\",\"Edit\",\"ListAgents\",\"Read\",\"ReportFindings\",\"ShareOnboardingGuide\",\"Skill\",\"ToolSearch\",\"Write\",\"mcp__claude_ai_Claude_Docs__batch\",\"mcp__claude_ai_Claude_Docs__guide\",\"mcp__claude_ai_Claude_Docs__update\"]}"
+      }
+    ],
+    "resolvedModel": "claude-sonnet-5-5",
+    "totalDurationMs": 1631,
+    "totalTokens": 24697,
+    "totalToolUseCount": 0,
+    "usage": {
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "input_tokens": 2,
+      "cache_creation_input_tokens": 24566,
+      "cache_read_input_tokens": 0,
+      "output_tokens": 129,
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 24566
+      },
+      "inference_geo": "global",
+      "iterations": [
+        {
+          "input_tokens": 2,
+          "output_tokens": 129,
+          "cache_read_input_tokens": 0,
+          "cache_creation_input_tokens": 24566,
+          "cache_creation": {
+            "ephemeral_5m_input_tokens": 24566,
+            "ephemeral_1h_input_tokens": 0
+          },
+          "type": "message"
+        }
+      ],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "canContinueAgent": true
+  },
+  "tool_use_id": "toolu_01UaSGph2DumuckgHtCsmEnn",
+  "duration_ms": 1638
+}

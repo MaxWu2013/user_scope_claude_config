@@ -1,0 +1,16 @@
+{
+  "session_id": "56ccb027-d43e-452b-b49b-d80519c4e5b6",
+  "transcript_path": "/Users/wujincheng/.claude/projects/-private-tmp-router-v2-probe/56ccb027-d43e-452b-b49b-d80519c4e5b6.jsonl",
+  "cwd": "/private/tmp/router-v2-probe",
+  "prompt_id": "5cd3d953-aa64-4a98-8f53-0bdee31fb02e",
+  "permission_mode": "default",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Workflow",
+  "tool_input": {
+    "script": "export const meta = { name: 'wf-model-probe', description: 'Workflow worker model probe' }\nconst a = await agent('Use the Read tool to read /tmp/router-v2-probe/README.md and reply with its first line only.', { label: 'no-model' })\nconst b = await agent('Reply with the single word sonnet-explicit.', { label: 'explicit-sonnet', model: 'sonnet' })\nreturn { a, b }\n"
+  },
+  "tool_use_id": "toolu_0147vdpt7WJVMbS4rkSN4vfH"
+}

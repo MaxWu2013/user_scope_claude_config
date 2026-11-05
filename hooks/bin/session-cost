@@ -28,9 +28,12 @@ import json
 import os
 import pwd
 import re
+import sqlite3
 import subprocess
 import sys
+import time
 from collections import Counter
+from urllib.parse import quote
 
 sys.dont_write_bytecode = True
 
@@ -536,6 +539,75 @@ def load_meta(path: str, agent: dict, warnings: list[str]) -> None:
         agent["launchedWithDefaults"] = payload["launchedWithDefaults"]
 
 
+def is_workflow_journal(path: str, folder: str | None) -> bool:
+    """subagents/workflows/<runId>/journal.jsonl is the workflow journal, not an agent."""
+    if not folder:
+        return False
+    try:
+        rel = os.path.relpath(path, folder)
+    except ValueError:
+        return False
+    parts = rel.split(os.sep)
+    return (
+        len(parts) == 4
+        and parts[0] == "subagents"
+        and parts[1] == "workflows"
+        and parts[3] == "journal.jsonl"
+        and parts[2] not in ("", ".", "..")
+    )
+
+
+def workflow_run_id(path: str, folder: str | None) -> str | None:
+    """runId when path is <session>/subagents/workflows/<runId>/agent-*.jsonl."""
+    if not folder:
+        return None
+    try:
+        rel = os.path.relpath(path, folder)
+    except ValueError:
+        return None
+    parts = rel.split(os.sep)
+    if (
+        len(parts) == 4
+        and parts[0] == "subagents"
+        and parts[1] == "workflows"
+        and parts[3].startswith("agent-")
+        and parts[3].endswith(".jsonl")
+        and parts[2] not in ("", ".", "..")
+    ):
+        return parts[2]
+    return None
+
+
+def attach_workflow_parents(agents: dict[str, dict]) -> None:
+    """Hang workflow workers under a synthetic node named by their runId."""
+    for agent in list(agents.values()):
+        run_id = agent.get("workflow_run")
+        if not isinstance(run_id, str) or run_id == "" or agent.get("id") == run_id:
+            continue
+        node = agents.get(run_id)
+        if node is None:
+            node = empty_agent(run_id)
+            node["spawns"] = {}
+            node["event_keys"] = set()
+            node["call_index"] = {}
+            node["agentType"] = "workflow"
+            node["parent"] = "main"
+            node["spawnDepth"] = 1
+            agents[run_id] = node
+        else:
+            if not node.get("agentType"):
+                node["agentType"] = "workflow"
+            if not node.get("parent"):
+                node["parent"] = "main"
+            if node.get("spawnDepth") is None:
+                node["spawnDepth"] = 1
+        agent["parent"] = run_id
+        if agent.get("spawnDepth") is None:
+            agent["spawnDepth"] = 2
+        if not agent.get("agentType"):
+            agent["agentType"] = "workflow-subagent"
+
+
 def scan_session(jsonl_path: str, folder: str | None, warnings: list[str]) -> tuple[dict, dict]:
     stats = {"lines": 0, "malformed": 0, "files": []}
     agents: dict[str, dict] = {}
@@ -580,18 +652,26 @@ def scan_session(jsonl_path: str, folder: str | None, warnings: list[str]) -> tu
                     stats["files"].append(path)
                     load_meta(path, agent, warnings)
                 elif name.endswith(".jsonl"):
+                    if is_workflow_journal(path, folder):
+                        continue
                     if name.startswith("agent-"):
                         agent_id = name[len("agent-"):-len(".jsonl")]
                     else:
                         agent_id = name[: -len(".jsonl")]
                     found_jsonl.add(agent_id)
                     agent = agents.get(agent_id) or make(agent_id)
+                    run_id = workflow_run_id(path, folder)
+                    if run_id:
+                        agent["workflow_run"] = run_id
                     stats["files"].append(path)
                     scan_jsonl(path, agent, warnings, stats)
     for agent_id in sorted(found_meta - found_jsonl):
         warn(warnings, f"meta.json without jsonl: {agent_id}")
     for agent_id in sorted(found_jsonl - found_meta):
         if agent_id == "main":
+            continue
+        agent = agents.get(agent_id)
+        if isinstance(agent, dict) and agent.get("workflow_run"):
             continue
         warn(warnings, f"jsonl without meta.json: {agent_id}")
     return agents, stats
@@ -1522,6 +1602,8 @@ def render_human(report: dict) -> str:
         lines.append(f"  scale factor: {format(float(ccusage_info['scale_factor']), '.12g')}")
         lines.append("  The session executor total above is still ccusage totalCost.")
     lines.append("")
+    lines.extend(render_arbitration(report))
+    lines.append("")
     coverage = report["coverage"]
     lines.append("Coverage")
     lines.append(f"  files: {len(coverage['files'])}")
@@ -1544,12 +1626,354 @@ def render_human(report: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def arbitration_ledger_path(config=None) -> str:
+    raw = cfg(config, "ledger_path")
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    return os.path.join(real_home(), ".claude", "logs", "opus-arbitration", "ledger.db")
+
+
+def _agent_uses_opus(agent: dict) -> bool:
+    models = agent.get("models")
+    if not isinstance(models, Counter):
+        models = agent.get("models") or {}
+    for model in models:
+        if family_of(model if isinstance(model, str) else None) == "opus":
+            return True
+    return False
+
+
+def _actual_model(agent: dict) -> str:
+    identity = agent.get("identity")
+    if isinstance(identity, dict):
+        model_id = identity.get("modelId")
+        if isinstance(model_id, str) and model_id:
+            return model_id
+    models = agent.get("models")
+    if isinstance(models, Counter) and models:
+        return max(models, key=lambda name: (models[name], name))
+    return "unknown"
+
+
+def _money_sum(agent: dict) -> float:
+    cost = agent.get("executor_cost")
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return 0.0
+    return float(cost)
+
+
+def load_arbitration(session_id: str, agents: dict[str, dict], config=None) -> dict:
+    """Read-only ledger summary. A missing ledger is available: false."""
+    path = arbitration_ledger_path(config)
+    if not path or not os.path.isfile(path):
+        return {"available": False}
+    uri = "file:%s?mode=ro" % quote(path, safe="/")
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error:
+        return {"available": False}
+    try:
+        conn.row_factory = sqlite3.Row
+        try:
+            runs = conn.execute(
+                "SELECT agent_id, kind FROM agent_runs WHERE session_id=?",
+                (session_id,),
+            ).fetchall()
+            requests = conn.execute(
+                "SELECT decision, state FROM requests WHERE session_id=?",
+                (session_id,),
+            ).fetchall()
+            grants = conn.execute(
+                "SELECT consumed_tool_use_id, expires FROM grants WHERE session_id=?",
+                (session_id,),
+            ).fetchall()
+        except sqlite3.Error:
+            return {"available": False}
+        denied_by_gate = _gate_denied_ids(conn, session_id)
+        unarbitrated_opus_runs = _event_count(conn, session_id, "unarbitrated_opus_run")
+        denied_workflow_spawns = _workflow_gate_denials(conn, session_id)
+    finally:
+        conn.close()
+    mod_denies, deny_transcripts = _mod_denied_spawns(session_id, agents, config)
+    denied_workflow_spawns += mod_denies
+    kinds = {}
+    for row in runs:
+        kinds[row["agent_id"]] = row["kind"]
+    costs = {
+        "main": 0.0,
+        "judge": 0.0,
+        "escalated_opus": 0.0,
+        "routine": 0.0,
+        "workflow_worker": 0.0,
+        "unclassified": 0.0,
+    }
+    coverage_warnings = []
+    workflow_workers: dict[str, int] = {}
+    for agent in agents.values():
+        amount = _money_sum(agent)
+        if agent.get("id") == "main":
+            costs["main"] += amount
+            continue
+        kind = kinds.get(agent.get("id"))
+        if kind == "judge":
+            bucket = "judge"
+        elif kind == "escalated":
+            bucket = "escalated_opus"
+        elif kind == "routine":
+            bucket = "routine"
+        elif kind == "workflow_worker":
+            bucket = "workflow_worker"
+            model_name = _actual_model(agent)
+            workflow_workers[model_name] = workflow_workers.get(model_name, 0) + 1
+            if _agent_uses_opus(agent):
+                coverage_warnings.append(
+                    "coverage_warning: unarbitrated_opus_agent %s" % agent.get("id")
+                )
+        else:
+            bucket = "unclassified"
+            if _agent_uses_opus(agent):
+                coverage_warnings.append(
+                    "coverage_warning: unarbitrated_opus_agent %s" % agent.get("id")
+                )
+        costs[bucket] += amount
+    decisions = {"CONTINUE": 0, "RETRY": 0, "ESCALATE": 0, "STOP": 0}
+    failed_closed = 0
+    for row in requests:
+        decision = row["decision"]
+        if decision in decisions:
+            decisions[decision] += 1
+        if row["state"] == "FAILED_CLOSED":
+            failed_closed += 1
+    now = time.time()
+    issued = len(grants)
+    consumed = 0
+    expired = 0
+    for row in grants:
+        used = row["consumed_tool_use_id"]
+        if isinstance(used, str) and used:
+            consumed += 1
+        elif isinstance(row["expires"], (int, float)) and row["expires"] < now:
+            expired += 1
+    judge_runs = sum(1 for kind in kinds.values() if kind == "judge")
+    return {
+        "available": True,
+        "costs": costs,
+        "candidates": len(requests),
+        "judge_runs": judge_runs,
+        "decisions": decisions,
+        "grants": {"issued": issued, "consumed": consumed, "expired": expired},
+        "failed_closed": failed_closed,
+        "coverage_warnings": coverage_warnings,
+        "denied_by_gate": denied_by_gate,
+        "unarbitrated_opus_runs": unarbitrated_opus_runs,
+        "workflow_workers": workflow_workers,
+        "denied_workflow_spawns": denied_workflow_spawns,
+        "denied_workflow_transcripts": deny_transcripts,
+    }
+
+
+def _event_count(conn, session_id: str, event: str) -> int:
+    """Count one event. A ledger without the events table counts zero."""
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE session_id=? AND event=?",
+            (session_id, event),
+        ).fetchone()
+    except sqlite3.Error:
+        return 0
+    if row is None:
+        return 0
+    try:
+        return int(row["n"])
+    except (TypeError, ValueError, KeyError):
+        return 0
+
+
+def _safe_session_id(session_id: str) -> bool:
+    return (
+        isinstance(session_id, str)
+        and session_id != ""
+        and "/" not in session_id
+        and "\\" not in session_id
+        and ".." not in session_id
+        and not session_id.startswith(".")
+    )
+
+
+def _workflow_gate_denials(conn, session_id: str) -> int:
+    """Gate denials of a Workflow call. A ledger without events counts zero."""
+    try:
+        rows = conn.execute(
+            "SELECT detail_json FROM events WHERE session_id=? AND event=?",
+            (session_id, "gate_denied"),
+        ).fetchall()
+    except sqlite3.Error:
+        return 0
+    count = 0
+    for row in rows:
+        raw = row["detail_json"]
+        if not isinstance(raw, str) or raw == "":
+            continue
+        try:
+            detail = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(detail, dict):
+            continue
+        code = detail.get("reason_code")
+        if code == "OPUS_WORKFLOW_DENIED" or (isinstance(code, str) and code.startswith("WORKFLOW_")):
+            count += 1
+    return count
+
+
+def _mod_denied_spawns(session_id: str, agents: dict, config) -> tuple[int, list[str]]:
+    """Count spawn-log records with decision deny, and list any that have a transcript."""
+    if not _safe_session_id(session_id):
+        return 0, []
+    home = cfg(config, "home")
+    if not isinstance(home, str) or home.strip() == "":
+        home = real_home()
+    path = os.path.join(
+        home, ".claude", "logs", "opus-arbitration", "mod", "spawns-%s.jsonl" % session_id,
+    )
+    if not os.path.isfile(path):
+        return 0, []
+    count = 0
+    transcripts = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                text = line.strip()
+                if text == "":
+                    continue
+                try:
+                    row = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(row, dict) or row.get("decision") != "deny":
+                    continue
+                count += 1
+                agent_id = row.get("agentId")
+                if isinstance(agent_id, str) and agent_id != "" and agent_id in agents:
+                    transcripts.append(agent_id)
+    except OSError:
+        return count, transcripts
+    transcripts.sort()
+    return count, transcripts
+
+
+def _gate_denied_ids(conn, session_id: str) -> list[str]:
+    """tool_use_ids the gate denied. A ledger without events yields none."""
+    try:
+        rows = conn.execute(
+            "SELECT detail_json FROM events WHERE session_id=? AND event=?",
+            (session_id, "gate_denied"),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    found = []
+    seen = set()
+    for row in rows:
+        raw = row["detail_json"]
+        if not isinstance(raw, str) or raw == "":
+            continue
+        try:
+            detail = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(detail, dict):
+            continue
+        tool_id = detail.get("tool_use_id")
+        if isinstance(tool_id, str) and tool_id and tool_id not in seen:
+            seen.add(tool_id)
+            found.append(tool_id)
+    found.sort()
+    return found
+
+
+_SPAWN_WARNING_PREFIX = "Agent spawn "
+_SPAWN_WARNING_SUFFIX = " has no sub-agent transcript"
+
+
+def _drop_denied_spawn_warnings(warnings: list[str], denied_ids: set[str]) -> list[str]:
+    """A gate-denied Agent spawn is not a missing transcript."""
+    if not denied_ids:
+        return warnings
+    kept = []
+    for item in warnings:
+        text = item[len("WARNING: "):] if item.startswith("WARNING: ") else item
+        if text.startswith(_SPAWN_WARNING_PREFIX) and text.endswith(_SPAWN_WARNING_SUFFIX):
+            tool_id = text[len(_SPAWN_WARNING_PREFIX):-len(_SPAWN_WARNING_SUFFIX)]
+            if tool_id in denied_ids:
+                continue
+        kept.append(item)
+    return kept
+
+
+def render_arbitration(report: dict) -> list[str]:
+    arb = report.get("arbitration") or {"available": False}
+    lines = ["Arbitration"]
+    if not arb.get("available"):
+        lines.append("  available: false")
+        return lines
+    costs = arb.get("costs") or {}
+    for name in ("main", "judge", "escalated_opus", "routine", "workflow_worker", "unclassified"):
+        lines.append("  cost %s: %s" % (name, money(costs.get(name))))
+    workers = arb.get("workflow_workers") or {}
+    if workers:
+        parts = ["%s=%s" % (model, workers[model]) for model in sorted(workers)]
+        lines.append("  workflow workers: " + ", ".join(parts))
+    else:
+        lines.append("  workflow workers: 0")
+    denied_spawns = arb.get("denied_workflow_spawns") or 0
+    lines.append("  denied workflow spawns: %s" % denied_spawns)
+    deny_transcripts = arb.get("denied_workflow_transcripts") or []
+    if deny_transcripts:
+        lines.append("  denied workflow transcripts: %s" % ", ".join(deny_transcripts))
+    else:
+        lines.append("  denied workflow transcripts: none")
+    lines.append("  denied workflow cost: %s" % money(0))
+    lines.append("  candidates: %s" % arb.get("candidates", 0))
+    lines.append("  judge runs: %s" % arb.get("judge_runs", 0))
+    decisions = arb.get("decisions") or {}
+    lines.append(
+        "  decisions CONTINUE=%s RETRY=%s ESCALATE=%s STOP=%s"
+        % (
+            decisions.get("CONTINUE", 0),
+            decisions.get("RETRY", 0),
+            decisions.get("ESCALATE", 0),
+            decisions.get("STOP", 0),
+        )
+    )
+    grants = arb.get("grants") or {}
+    lines.append(
+        "  grants issued=%s consumed=%s expired=%s"
+        % (grants.get("issued", 0), grants.get("consumed", 0), grants.get("expired", 0))
+    )
+    lines.append("  FAILED_CLOSED: %s" % arb.get("failed_closed", 0))
+    lines.append("  unarbitrated_opus_runs: %s" % arb.get("unarbitrated_opus_runs", 0))
+    denied = arb.get("denied_by_gate") or []
+    if denied:
+        for item in denied:
+            lines.append("  denied_by_gate: %s" % item)
+    else:
+        lines.append("  denied_by_gate: 0")
+    warnings = arb.get("coverage_warnings") or []
+    if warnings:
+        for item in warnings:
+            lines.append("  %s" % item)
+    else:
+        lines.append("  coverage warnings: 0")
+    return lines
+
+
 def audit(session_id: str, use_ccusage: bool, config=None) -> dict:
     root = projects_root(config)
     jsonl_path, folder = resolve_session(root, session_id)
     warnings: list[str] = []
     agents, stats = scan_session(jsonl_path, folder, warnings)
     link_tree(agents, warnings)
+    attach_workflow_parents(agents)
     empirical: dict = {}
     settle_calls(agents, warnings, empirical)
     apply_pins(agents, cfg(config, "home"))
@@ -1582,6 +2006,10 @@ def audit(session_id: str, use_ccusage: bool, config=None) -> dict:
         summary = None
     apply_advisor_costs(agents, table, pricing_path, warnings)
     report = build_report(session_id, agents, stats, warnings, empirical, summary, pricing_path)
+    report["arbitration"] = load_arbitration(session_id, agents, config)
+    denied_ids = set(report["arbitration"].get("denied_by_gate") or [])
+    if denied_ids:
+        report["warnings"] = _drop_denied_spawn_warnings(report["warnings"], denied_ids)
     human_lines = []
     for agent in ordered_agents(agents):
         human_lines.extend(render_agent(agent, summary))

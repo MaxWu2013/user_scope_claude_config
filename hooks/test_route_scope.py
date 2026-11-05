@@ -584,7 +584,7 @@ def routing_reads_cases(suite, home, other, tree, log_root, read_main, bash_read
     )
     opus_deny = (
         'effective model opus (per-call); pass model: "sonnet" (or "haiku"), '
-        "or use a pinned agent, or set CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT=1."
+        "or use a pinned agent."
     )
     agent_log = log_root / "agent-reads-off.jsonl"
     expect_aw(
@@ -1021,7 +1021,7 @@ def main():
         )
         opus_deny = (
             'effective model opus (per-call); pass model: "sonnet" (or "haiku"), '
-            "or use a pinned agent, or set CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT=1."
+            "or use a pinned agent."
         )
         opus_log = log_root / "pilot-agent.jsonl"
         suite.expect(

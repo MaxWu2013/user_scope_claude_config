@@ -1,0 +1,80 @@
+{
+  "env": {
+    "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": "sonnet",
+    "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS": "4",
+    "CLAUDE_CODE_PLUGIN_DIRS": "<home>/.claude/mods/opus-workflow-spawn"
+  },
+  "PreToolUse": [
+    {
+      "matcher": "Agent|Task|SendMessage|Workflow|Skill",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 \"$HOME/.claude/hooks/opus-arbitration-gate.py\"",
+          "onFailure": "block",
+          "timeout": 10
+        }
+      ]
+    },
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 \"$HOME/.claude/hooks/opus-workflow-guard.py\"",
+          "onFailure": "block",
+          "timeout": 5
+        }
+      ]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "Agent|SendMessage|Bash|Workflow",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 \"$HOME/.claude/hooks/opus-arbitration-post.py\"",
+          "onFailure": "continue",
+          "timeout": 10
+        }
+      ]
+    }
+  ],
+  "PostToolUseFailure": [
+    {
+      "matcher": "Agent|Bash",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 \"$HOME/.claude/hooks/opus-arbitration-post.py\"",
+          "onFailure": "continue",
+          "timeout": 10
+        }
+      ]
+    }
+  ],
+  "SubagentStart": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 \"$HOME/.claude/hooks/opus-workflow-guard.py\"",
+          "onFailure": "continue",
+          "timeout": 5
+        }
+      ]
+    }
+  ],
+  "SubagentStop": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 \"$HOME/.claude/hooks/opus-workflow-guard.py\"",
+          "onFailure": "continue",
+          "timeout": 5
+        }
+      ]
+    }
+  ]
+}

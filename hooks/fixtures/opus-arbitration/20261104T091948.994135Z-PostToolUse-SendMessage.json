@@ -1,0 +1,30 @@
+{
+  "session_id": "5a2a785b-bdf6-41e3-86d6-30ce76adf1c3",
+  "transcript_path": "/Users/wujincheng/.claude/projects/-private-tmp-router-v2-probe/5a2a785b-bdf6-41e3-86d6-30ce76adf1c3.jsonl",
+  "cwd": "/private/tmp/router-v2-probe",
+  "prompt_id": "7524fbd9-d0a2-46d4-876a-1a05c9d903f7",
+  "permission_mode": "default",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "SendMessage",
+  "tool_input": {
+    "to": "a9a5e80c63142c42f",
+    "summary": "Ask probe-sonnet to say ok again",
+    "message": "say ok again"
+  },
+  "tool_response": {
+    "success": true,
+    "message": "Resuming agent a9a5e80",
+    "resumedAgentId": "a9a5e80c63142c42f",
+    "revivedAgentId": "a9a5e80c63142c42f",
+    "pin": {
+      "id": "a9a5e80c63142c42f",
+      "name": "a9a5e80c63142c42f",
+      "ref": "95beb8"
+    }
+  },
+  "tool_use_id": "toolu_01J7nDGWrQxpmqUpK3xcDcsK",
+  "duration_ms": 11
+}

@@ -1449,7 +1449,7 @@ EXPLORE_AGENT_DENY = "Explore is off in strict mode; use file-reader."
 def effective_deny(effective, source):
     return (
         'effective model %s (%s); pass model: "sonnet" (or "haiku"), '
-        "or use a pinned agent, or set CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT=1."
+        "or use a pinned agent."
         % (effective, source)
     )
 READ_LINE_EXTRA = " Read a smaller range with offset and limit, or use file-reader for large files."
@@ -1615,7 +1615,7 @@ def _effective_model_cases(suite, extra_dirs, empty_home):
     _spawn_both(
         suite, extra_dirs, "file-writer opus",
         payload("Agent", {"subagent_type": "file-writer", "model": "opus", "description": "write", "prompt": "x"}),
-        strict="allow", effective_model="opus", effective_source="per-call",
+        strict="deny", effective_model="opus", effective_source="per-call",
         subagent_type="file-writer", model="opus", description="write", env=base,
     )
     _spawn_both(
@@ -1626,9 +1626,9 @@ def _effective_model_cases(suite, extra_dirs, empty_home):
     )
     allow_plan = {"HOME": home, "CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT": "1"}
     _spawn_both(
-        suite, extra_dirs, "override env allows Plan",
+        suite, extra_dirs, "override env does not allow Plan",
         payload("Agent", {"subagent_type": "Plan", "description": "plan", "prompt": "x"}),
-        strict="allow", effective_model="inherit-main", effective_source="builtin-inherit",
+        strict="deny", effective_model="inherit-main", effective_source="builtin-inherit",
         subagent_type="Plan", model="default", description="plan", env=allow_plan,
     )
 
@@ -1879,21 +1879,23 @@ def case_25(suite, extra_dirs):
     allow_log, allow_env = _fresh_env(extra_dirs, {"CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT": "1"})
     suite.expect(
         "25",
-        "strict Agent opus allowed by env -> silent",
+        "strict Agent opus env override -> deny",
         payload("Agent", {"model": "opus", "description": "deep", "prompt": "x"}),
-        "silent",
+        "deny",
+        effective_deny("opus", "per-call"),
         env_extra=allow_env,
     )
     check_spawn(
         suite,
-        "allowed opus Agent logged",
+        "opus env override logged deny",
         allow_log,
         role="orchestrator",
         subagent_type="general-purpose",
         model="opus",
         description="deep",
         mode="strict",
-        decision="allow-log",
+        decision="deny",
+        reason=effective_deny("opus", "per-call"),
         effective_model="opus",
         effective_source="per-call",
     )

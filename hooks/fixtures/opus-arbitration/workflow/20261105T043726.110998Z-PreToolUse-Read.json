@@ -1,0 +1,16 @@
+{
+  "session_id": "56ccb027-d43e-452b-b49b-d80519c4e5b6",
+  "transcript_path": "/Users/wujincheng/.claude/projects/-private-tmp-router-v2-probe/56ccb027-d43e-452b-b49b-d80519c4e5b6.jsonl",
+  "cwd": "/private/tmp/router-v2-probe",
+  "prompt_id": "5cd3d953-aa64-4a98-8f53-0bdee31fb02e",
+  "permission_mode": "default",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "/tmp/router-v2-probe/wf_probe.js"
+  },
+  "tool_use_id": "toolu_01F7KE15mBGqrGYRGvTGp7wG"
+}

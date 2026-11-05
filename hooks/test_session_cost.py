@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -1282,6 +1283,311 @@ def test_scaled_cost(tally: Tally):
     )
 
 
+def test_arbitration_ledger(tally: Tally):
+    root = Path(tempfile.mkdtemp(prefix="session-cost-arb-"))
+    home = root / "home"
+    home.mkdir()
+    projects = root / "projects"
+    stub = root / "ccusage"
+    payload = root / "payload.json"
+    prices = root / "prices.json"
+    stub_script(stub)
+    pricing_file(prices)
+    session = projects / "proj" / SID
+    sub = session / "subagents"
+    agents = (
+        ("judge", "toolu_judge", "claude-haiku-5-5", 20, 2.5, "2026-06-01T00:01:00.000Z"),
+        ("worker", "toolu_worker", "claude-opus-5-5", 30, 3.5, "2026-06-01T00:02:00.000Z"),
+        ("clerk", "toolu_clerk", "claude-sonnet-5-5", 40, 4.5, "2026-06-01T00:03:00.000Z"),
+        ("stray", "toolu_stray", "claude-opus-5-5", 50, 5.5, "2026-06-01T00:04:00.000Z"),
+    )
+    spawns = [
+        {
+            "type": "tool_use",
+            "id": tool_id,
+            "name": "Agent",
+            "input": {"subagent_type": agent_id, "description": agent_id},
+        }
+        for agent_id, tool_id, _model, _tokens, _cost, _ts in agents
+    ]
+    spawns.append({
+        "type": "tool_use",
+        "id": "toolu_denied",
+        "name": "Agent",
+        "input": {"subagent_type": "general-purpose", "model": "opus", "description": "denied"},
+    })
+    spawns.append({
+        "type": "tool_use",
+        "id": "toolu_missing",
+        "name": "Agent",
+        "input": {"subagent_type": "file-writer", "description": "missing"},
+    })
+    write_jsonl(
+        projects / "proj" / f"{SID}.jsonl",
+        [
+            assistant(
+                "msg-main",
+                "claude-opus-5-5",
+                "2026-06-01T00:00:00.000Z",
+                usage(10, 0),
+                spawns,
+                "req-main",
+            ),
+        ],
+    )
+    entries = [entry("2026-06-01T00:00:00.000Z", "claude-opus-5-5", 10, 0, 1.5)]
+    for agent_id, tool_id, model, tokens, cost, timestamp in agents:
+        write_jsonl(
+            sub / f"agent-{agent_id}.jsonl",
+            [assistant(f"msg-{agent_id}", model, timestamp, usage(tokens, 0), [{"type": "text", "text": agent_id}], f"req-{agent_id}")],
+        )
+        (sub / f"agent-{agent_id}.meta.json").write_text(
+            json.dumps({
+                "agentType": agent_id,
+                "toolUseId": tool_id,
+                "spawnDepth": 1,
+                "isBuiltIn": False,
+            }),
+            encoding="utf-8",
+        )
+        entries.append(entry(timestamp, model, tokens, 0, cost))
+    ccusage_payload(payload, entries, 17.5, 150)
+    ledger = root / "ledger.db"
+    conn = sqlite3.connect(ledger)
+    conn.executescript(
+        """
+        CREATE TABLE requests (request_id TEXT, session_id TEXT, decision TEXT, state TEXT);
+        CREATE TABLE grants (grant_id TEXT, session_id TEXT, consumed_tool_use_id TEXT, expires REAL);
+        CREATE TABLE agent_runs (agent_id TEXT, session_id TEXT, kind TEXT);
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY,
+            ts TEXT,
+            session_id TEXT,
+            event TEXT,
+            request_id TEXT,
+            detail_json TEXT
+        );
+        """
+    )
+    conn.executemany(
+        "INSERT INTO requests VALUES (?,?,?,?)",
+        (
+            ("esc-c", SID, "CONTINUE", "JUDGED_CONTINUE"),
+            ("esc-r", SID, "RETRY", "JUDGED_RETRY"),
+            ("esc-e", SID, "ESCALATE", "GRANT_CONSUMED"),
+            ("esc-s", SID, "STOP", "JUDGED_STOP"),
+            ("esc-f", SID, None, "FAILED_CLOSED"),
+        ),
+    )
+    conn.executemany(
+        "INSERT INTO agent_runs VALUES (?,?,?)",
+        (
+            ("judge", SID, "judge"),
+            ("worker", SID, "escalated"),
+            ("clerk", SID, "routine"),
+        ),
+    )
+    conn.execute(
+        "INSERT INTO events (ts, session_id, event, request_id, detail_json) VALUES (?,?,?,?,?)",
+        (
+            "2026-06-01T00:00:00Z",
+            SID,
+            "gate_denied",
+            None,
+            json.dumps({"tool_use_id": "toolu_denied", "reason_code": "OPUS_DENIED"}),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    config = base_config(projects, home, stub, prices)
+    missing = dict(config)
+    missing["ledger_path"] = str(root / "no-ledger.db")
+    present = dict(config)
+    present["ledger_path"] = str(ledger)
+    env = stub_env(payload)
+    bare = json.loads(run([SID, "--json"], missing, env).stdout)
+    report = json.loads(run([SID, "--json"], present, env).stdout)
+    human = run([SID], present, env)
+    arb = report.get("arbitration") or {}
+    costs = arb.get("costs") or {}
+    warning_text = "\n".join(report.get("warnings") or [])
+    tally.check(
+        "ledger absent is available false",
+        bare.get("arbitration") == {"available": False}
+        and "available: false" in run([SID], missing, env).stdout,
+        str(bare.get("arbitration")),
+    )
+    tally.check(
+        "arbitration category costs match agent buckets",
+        arb.get("available") is True
+        and costs.get("main") == agent_by_id(report, "main")["executor"]["cost"]
+        and costs.get("judge") == agent_by_id(report, "judge")["executor"]["cost"]
+        and costs.get("escalated_opus") == agent_by_id(report, "worker")["executor"]["cost"]
+        and costs.get("routine") == agent_by_id(report, "clerk")["executor"]["cost"]
+        and costs.get("unclassified") == agent_by_id(report, "stray")["executor"]["cost"]
+        and costs.get("judge") == 2.5
+        and costs.get("escalated_opus") == 3.5
+        and costs.get("routine") == 4.5
+        and costs.get("main") == 1.5
+        and costs.get("unclassified") == 5.5,
+        "costs=%s" % costs,
+    )
+    tally.check(
+        "decision counts, denied_by_gate, and unarbitrated opus",
+        arb.get("decisions") == {"CONTINUE": 1, "RETRY": 1, "ESCALATE": 1, "STOP": 1}
+        and arb.get("failed_closed") == 1
+        and arb.get("denied_by_gate") == ["toolu_denied"]
+        and "coverage_warning: unarbitrated_opus_agent stray" in arb.get("coverage_warnings", [])
+        and "denied_by_gate: toolu_denied" in human.stdout
+        and "Agent spawn toolu_denied has no sub-agent transcript" not in warning_text
+        and "Agent spawn toolu_denied has no sub-agent transcript" not in human.stdout
+        and "Agent spawn toolu_missing has no sub-agent transcript" in warning_text
+        and "cost routine:" in human.stdout,
+        "arb=%s warnings=%s" % (arb, warning_text),
+    )
+
+
+def test_workflow_workers(tally: Tally):
+    root = Path(tempfile.mkdtemp(prefix="session-cost-wf-"))
+    home = root / "home"
+    home.mkdir()
+    projects = root / "projects"
+    stub = root / "ccusage"
+    payload = root / "payload.json"
+    prices = root / "prices.json"
+    stub_script(stub)
+    pricing_file(prices)
+    session = projects / "proj" / SID
+    run_id = "wf_cost"
+    workers = session / "subagents" / "workflows" / run_id
+    write_jsonl(
+        projects / "proj" / f"{SID}.jsonl",
+        [assistant("msg-main", "claude-opus-5-5", "2026-06-02T00:00:00.000Z", usage(10, 0), [{"type": "text", "text": "main"}], "req-main")],
+    )
+    entries = [entry("2026-06-02T00:00:00.000Z", "claude-opus-5-5", 10, 0, 1.0)]
+    specs = (
+        ("wfsonnet", "claude-sonnet-5-5", 20, 2.0, "2026-06-02T00:01:00.000Z"),
+        ("wfopus", "claude-opus-5-5", 30, 3.0, "2026-06-02T00:02:00.000Z"),
+    )
+    for agent_id, model, tokens, cost, timestamp in specs:
+        write_jsonl(
+            workers / f"agent-{agent_id}.jsonl",
+            [
+                {
+                    "type": "attachment",
+                    "attachment": {"type": "model", "identity": {"modelId": model, "marketingName": model}},
+                },
+                assistant(f"msg-{agent_id}", model, timestamp, usage(tokens, 0), [{"type": "text", "text": agent_id}], f"req-{agent_id}"),
+            ],
+        )
+        entries.append(entry(timestamp, model, tokens, 0, cost))
+    (workers / "journal.jsonl").write_text(
+        json.dumps({"type": "journal", "note": "workflow journal, not an agent"}) + "\n",
+        encoding="utf-8",
+    )
+    ccusage_payload(payload, entries, 6.0, 60)
+    ledger = root / "ledger.db"
+    conn = sqlite3.connect(ledger)
+    conn.executescript(
+        """
+        CREATE TABLE requests (request_id TEXT, session_id TEXT, decision TEXT, state TEXT);
+        CREATE TABLE grants (grant_id TEXT, session_id TEXT, consumed_tool_use_id TEXT, expires REAL);
+        CREATE TABLE agent_runs (agent_id TEXT, session_id TEXT, kind TEXT);
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY, ts TEXT, session_id TEXT, event TEXT, request_id TEXT, detail_json TEXT
+        );
+        """
+    )
+    conn.executemany(
+        "INSERT INTO agent_runs VALUES (?,?,?)",
+        (("wfsonnet", SID, "workflow_worker"), ("wfopus", SID, "workflow_worker")),
+    )
+    conn.execute(
+        "INSERT INTO events (ts, session_id, event, request_id, detail_json) VALUES (?,?,?,?,?)",
+        (
+            "2026-06-02T00:00:00Z",
+            SID,
+            "gate_denied",
+            None,
+            json.dumps({"tool_use_id": "wf-denied", "reason_code": "OPUS_WORKFLOW_DENIED"}),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    mod = home / ".claude" / "logs" / "opus-arbitration" / "mod"
+    mod.mkdir(parents=True)
+    (mod / ("spawns-%s.jsonl" % SID)).write_text(
+        "\n".join([
+            json.dumps({
+                "session_id": SID,
+                "runId": run_id,
+                "agentIndex": 1,
+                "agentId": "wfsonnet",
+                "model_requested": None,
+                "model_forced": "sonnet",
+                "decision": "allow",
+                "ts": "2026-06-02T00:01:00Z",
+            }),
+            json.dumps({
+                "session_id": SID,
+                "runId": run_id,
+                "agentIndex": 2,
+                "agentId": None,
+                "model_requested": "opus",
+                "model_forced": "sonnet",
+                "decision": "allow",
+                "ts": "2026-06-02T00:02:30Z",
+            }),
+            json.dumps({
+                "session_id": SID,
+                "runId": run_id,
+                "agentIndex": 3,
+                "decision": "deny",
+                "reason": "WORKFLOW_SPAWN_CAP run=13/12 session=13/30",
+                "ts": "2026-06-02T00:03:00Z",
+            }),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    config = base_config(projects, home, stub, prices)
+    config["ledger_path"] = str(ledger)
+    report = json.loads(run([SID, "--json"], config, stub_env(payload)).stdout)
+    human = run([SID], config, stub_env(payload))
+    arb = report.get("arbitration") or {}
+    costs = arb.get("costs") or {}
+    sonnet = agent_by_id(report, "wfsonnet")
+    opus = agent_by_id(report, "wfopus")
+    node = agent_by_id(report, run_id)
+    unmatched = (report.get("ccusage") or {}).get("unmatched_entries")
+    warning_text = "\n".join(report.get("warnings") or [])
+    tally.check(
+        "workflow workers sit under their run and match ccusage",
+        sonnet.get("parent") == run_id
+        and opus.get("parent") == run_id
+        and node.get("parent") == "main"
+        and node.get("agentType") == "workflow"
+        and unmatched == 0
+        and costs.get("workflow_worker") == sonnet["executor"]["cost"] + opus["executor"]["cost"]
+        and arb.get("workflow_workers") == {"claude-opus-5-5": 1, "claude-sonnet-5-5": 1}
+        and arb.get("denied_workflow_spawns") == 2
+        and "denied workflow spawns: 2" in human.stdout
+        and "denied workflow transcripts: none" in human.stdout
+        and "denied workflow cost: $0" in human.stdout
+        and "workflow workers: claude-opus-5-5=1, claude-sonnet-5-5=1" in human.stdout
+        and "coverage_warning: unarbitrated_opus_agent wfopus" in arb.get("coverage_warnings", [])
+        and "coverage_warning: unarbitrated_opus_agent wfsonnet" not in arb.get("coverage_warnings", [])
+        and agent_by_id(report, "journal") is None
+        and "jsonl without meta.json: journal" not in warning_text
+        and "jsonl without meta.json: journal" not in human.stdout
+        and arb.get("denied_workflow_transcripts") == [],
+        "parent=%s/%s node=%s unmatched=%s costs=%s workers=%s warnings=%s journal=%s" % (
+            sonnet.get("parent"), opus.get("parent"), node.get("parent"), unmatched,
+            costs, arb.get("workflow_workers"), arb.get("coverage_warnings"),
+            warning_text,
+        ),
+    )
+
+
 def main():
     tally = Tally()
     test_core(tally)
@@ -1295,6 +1601,8 @@ def main():
     test_growing_chunks(tally)
     test_inherit_pin(tally)
     test_scaled_cost(tally)
+    test_arbitration_ledger(tally)
+    test_workflow_workers(tally)
     return tally.finish()
 
 

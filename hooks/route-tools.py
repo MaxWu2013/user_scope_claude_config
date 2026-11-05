@@ -88,9 +88,6 @@ WRITER_READ_DENY = "file-writer may only Read documents."
 WRITER_OBSIDIAN_READ_DENY = "file-writer may not read the vault through Obsidian."
 WRITER_READ_CLASSES = {"document", "vault_structured"}
 EXPLORE_AGENT_DENY = "Explore is off in strict mode; use file-reader."
-_AGENT_TYPE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
-# Frontmatter is at the top. Cap the read so a huge agent file cannot stall the hook.
-_AGENT_DEF_CAP = 65536
 
 _SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _READ_FILE_BUDGET = 10
@@ -1689,186 +1686,38 @@ def opus_subagent_deny(effective, source):
     """Name the effective model and where it came from."""
     return (
         'effective model %s (%s); pass model: "sonnet" (or "haiku"), '
-        "or use a pinned agent, or set CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT=1."
+        "or use a pinned agent."
         % (effective, source)
     )
 
 
-def _model_family(text):
-    """opus, sonnet, haiku, inherit, or unknown.
+def _bind_agent_model():
+    """Load the shared resolver beside this file. A copied script still starts."""
+    root = os.path.dirname(os.path.realpath(__file__))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    import _agent_model as agent_model
 
-    inherit is the whole token. The other families match an id that contains
-    the name. opus wins when a string contains more than one family.
-    """
-    if not isinstance(text, str):
-        return "unknown"
-    low = text.strip().lower()
-    if low == "":
-        return "unknown"
-    if "opus" in low:
-        return "opus"
-    if low == "inherit":
-        return "inherit"
-    if "sonnet" in low:
-        return "sonnet"
-    if "haiku" in low:
-        return "haiku"
-    return "unknown"
+    return agent_model
 
 
-def _env_subagent_family():
-    """sonnet or haiku from CLAUDE_CODE_SUBAGENT_MODEL, else None.
+try:
+    _agent_model_mod = _bind_agent_model()
+except Exception:
+    _agent_model_mod = None
 
-    An opus or unknown env value does not count: the caller falls through to
-    inherit-main. A blank value is unset.
-    """
-    raw = os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL")
-    if not isinstance(raw, str) or raw.strip() == "":
-        return None
-    family = _model_family(raw)
-    if family in ("sonnet", "haiku"):
-        return family
-    return None
-
-
-def _agent_project(d):
-    """Project whose .claude/agents directory wins over the user directory.
-
-    Payload cwd, then CLAUDE_PROJECT_DIR, then the process cwd. This matches
-    project_dir() for the env and process cwd, and also honours the cwd field
-    Claude puts on the hook payload.
-    """
-    raw_cwd = d.get("cwd") if isinstance(d, dict) else None
-    if isinstance(raw_cwd, str) and raw_cwd.strip():
-        text = os.path.expanduser(raw_cwd.strip().replace("\\", "/"))
-        if not os.path.isabs(text):
-            base = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-            text = os.path.join(base, text)
-        return os.path.realpath(text)
-    raw = os.environ.get("CLAUDE_PROJECT_DIR")
-    if isinstance(raw, str) and raw.strip():
-        return os.path.realpath(raw)
-    return os.path.realpath(os.getcwd())
-
-
-def _read_frontmatter_model(path):
-    """("ok", model or None) or ("fail", None).
-
-    None means the frontmatter closed and had no model line. A missing file
-    is the caller's concern. Unreadable, not a regular file, too large to
-    hold a closed frontmatter, or malformed frontmatter is fail.
-    """
-    try:
-        info = os.lstat(path)
-    except OSError:
-        return "fail", None
-    if not stat.S_ISREG(info.st_mode):
-        return "fail", None
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError:
-        return "fail", None
-    try:
-        try:
-            blob = os.read(fd, _AGENT_DEF_CAP)
-        except OSError:
-            return "fail", None
-    finally:
-        os.close(fd)
-    text = blob.decode("utf-8", errors="replace")
-    lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
-        return "fail", None
-    closing = None
-    for index, line in enumerate(lines[1:], start=1):
-        if line.strip() == "---":
-            closing = index
-            break
-    if closing is None:
-        return "fail", None
-    for line in lines[1:closing]:
-        if ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        if key.strip() != "model":
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1].strip()
-        return "ok", value or None
-    return "ok", None
-
-
-def _from_definition_model(value, source):
-    """Map a parsed model line to (effective_model, effective_source).
-
-    An explicit inherit stays inherit-main even when the env default is
-    sonnet or haiku: the definition beats the env default. A missing model
-    line uses that env default.
-    """
-    if value is None:
-        family = _env_subagent_family()
-        if family:
-            return family, "env-default"
-        return "inherit-main", "builtin-inherit"
-    family = _model_family(value)
-    if family == "inherit":
-        return "inherit-main", source
-    if family in ("opus", "sonnet", "haiku"):
-        return family, source
-    return "unknown", source
-
-
-def _lookup_definition(subagent_type, project):
-    """(effective, source) when a project or user file exists, else None.
-
-    Project wins. A file that exists but cannot be parsed is unknown, and
-    the user file is not consulted after that.
-    """
-    if not isinstance(subagent_type, str) or not _AGENT_TYPE_RE.fullmatch(subagent_type):
-        return None
-    name = subagent_type + ".md"
-    candidates = (
-        ("project-def", os.path.join(project, ".claude", "agents", name)),
-        ("user-def", os.path.join(os.path.expanduser("~"), ".claude", "agents", name)),
-    )
-    for source, path in candidates:
-        if not os.path.lexists(path):
-            continue
-        status, value = _read_frontmatter_model(path)
-        if status != "ok":
-            return "unknown", "unknown"
-        return _from_definition_model(value, source)
-    return None
-
-
-def effective_agent_model(d, ti, subagent_type):
-    """(effective_model, effective_source) for one Agent call.
-
-    effective_model is opus, sonnet, haiku, inherit-main, or unknown.
-    effective_source is per-call, user-def, project-def, env-default,
-    builtin-inherit, or unknown. inherit-main means the hook treats the
-    spawn as the main model, which strict mode assumes is Opus.
-    """
-    raw = ti.get("model") if isinstance(ti, dict) else None
-    if isinstance(raw, str) and raw.strip():
-        family = _model_family(raw)
-        if family == "inherit":
-            return "inherit-main", "per-call"
-        return family, "per-call"
-    found = _lookup_definition(subagent_type, _agent_project(d))
-    if found is not None:
-        return found
-    if subagent_type == "general-purpose":
-        family = _env_subagent_family()
-        if family:
-            return family, "env-default"
-    return "inherit-main", "builtin-inherit"
-
-
-def _per_call_opus(ti):
-    raw = ti.get("model") if isinstance(ti, dict) else None
-    return isinstance(raw, str) and "opus" in raw.lower()
+effective_agent_model = None
+if _agent_model_mod is not None:
+    _AGENT_TYPE_RE = _agent_model_mod._AGENT_TYPE_RE
+    _AGENT_DEF_CAP = _agent_model_mod._AGENT_DEF_CAP
+    _model_family = _agent_model_mod._model_family
+    _env_subagent_family = _agent_model_mod._env_subagent_family
+    _agent_project = _agent_model_mod._agent_project
+    _read_frontmatter_model = _agent_model_mod._read_frontmatter_model
+    _from_definition_model = _agent_model_mod._from_definition_model
+    _lookup_definition = _agent_model_mod._lookup_definition
+    effective_agent_model = _agent_model_mod.effective_agent_model
+    _per_call_opus = _agent_model_mod._per_call_opus
 
 
 def _spawn_fields(ti):
@@ -1898,8 +1747,27 @@ def handle_agent(role, d, ti, mode):
     Effective Opus is per-call opus, inherit (treated as the main model), or
     an unknown model. task-aware only logs. Never rewrites tool input. Fail
     open: a raise in the caller exits 0. mode is already on the common record.
+    A missing model resolver logs one record and allows; the Opus gate decides.
     """
     subagent_type, model, description = _spawn_fields(ti)
+    if effective_agent_model is None:
+        extra = {
+            "subagent_type": subagent_type,
+            "model": model,
+            "description": description,
+            "effective_model": "unknown",
+            "effective_source": "import-failed",
+        }
+        _LOG["extra"] = extra
+        append_routing_log(
+            role,
+            _agent_type(d),
+            "Agent",
+            _LOG.get("path"),
+            decision="allow-log",
+            extra=extra,
+        )
+        return 0
     effective, source = effective_agent_model(d, ti, subagent_type)
     extra = {
         "subagent_type": subagent_type,
@@ -1913,10 +1781,8 @@ def handle_agent(role, d, ti, mode):
         if subagent_type == "Explore":
             return deny(EXPLORE_AGENT_DENY)
         blocked = effective in ("opus", "inherit-main", "unknown")
-        writer_opus = subagent_type == "file-writer" and _per_call_opus(ti)
-        if blocked and not writer_opus:
-            if os.environ.get("CLAUDE_ROUTING_ALLOW_OPUS_SUBAGENT") != "1":
-                return deny(opus_subagent_deny(effective, source))
+        if blocked:
+            return deny(opus_subagent_deny(effective, source))
     append_routing_log(
         role,
         _agent_type(d),

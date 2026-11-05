@@ -1,0 +1,31 @@
+{
+  "session_id": "5a2a785b-bdf6-41e3-86d6-30ce76adf1c3",
+  "transcript_path": "/Users/wujincheng/.claude/projects/-private-tmp-router-v2-probe/5a2a785b-bdf6-41e3-86d6-30ce76adf1c3.jsonl",
+  "cwd": "/private/tmp/router-v2-probe",
+  "prompt_id": "7524fbd9-d0a2-46d4-876a-1a05c9d903f7",
+  "permission_mode": "default",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Agent",
+  "tool_input": {
+    "description": "Run sonnet probe background",
+    "prompt": "run probe",
+    "subagent_type": "probe-sonnet",
+    "run_in_background": true
+  },
+  "tool_response": {
+    "isAsync": true,
+    "status": "async_launched",
+    "agentId": "a85b8270033ee0078",
+    "description": "Run sonnet probe background",
+    "resolvedModel": "claude-sonnet-5-5",
+    "prompt": "run probe",
+    "outputFile": "/private/tmp/claude-501/-private-tmp-router-v2-probe/5a2a785b-bdf6-41e3-86d6-30ce76adf1c3/tasks/a85b8270033ee0078.output",
+    "canReadOutputFile": true,
+    "canContinueAgent": true
+  },
+  "tool_use_id": "toolu_01GpYHRVJQr8iDYYWGXbcbcM",
+  "duration_ms": 3
+}

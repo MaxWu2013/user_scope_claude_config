@@ -37,6 +37,15 @@ _READ_TASK = (
     "and larger reads, Grep, Glob, Bash reads and search go to file-reader."
 )
 _SAFE_READ = "The file-reader searches with safe-read rg -e A -e B (no | or parentheses)."
+_ARBITRATION_TASK = (
+    "Opus subagents need arbitration: if a hook replies ARBITRATION_REQUIRED or "
+    "ARBITRATION_CANDIDATE, launch the opus-judge agent in the foreground with the short "
+    "prompt the hook gives (ARBITRATION-PACKET request_id=…), then follow its "
+    "ARBITRATION_DECISION (CONTINUE/RETRY at most once/STOP without Opus; ESCALATE: issue "
+    "exactly the granted call). Never retry an Opus call directly, never launch opus-judge "
+    "without a packet, and never use background or nested Opus agents."
+)
+_ARBITRATION_STRICT = "Opus subagents are denied in strict mode; use sonnet or haiku."
 
 
 def _blank(value):
@@ -65,11 +74,13 @@ def _context_text(mode, reads_routed):
     sentences = [_CODE, _STATE]
     if mode == "task-aware":
         sentences.append(_DOC_TASK)
+        sentences.append(_ARBITRATION_TASK)
         if reads_routed:
             sentences.append(_READ_TASK)
             sentences.append(_SAFE_READ)
     else:
         sentences.append(_DOC_STRICT)
+        sentences.append(_ARBITRATION_STRICT)
         if reads_routed:
             sentences.append(_READ_STRICT)
             sentences.append(_SAFE_READ)

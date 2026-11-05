@@ -27,3 +27,9 @@ spec path under /tmp/<repo>/<date-time>/specs/, write the approved task spec the
 then invoke ~/.claude/hooks/bin/cursor-run <printed path>; cursor-run is a Bash
 executable, not a subagent. Never put specs in .claude/specs and never call
 cursor-agent -p directly.
+
+## Opus arbitration
+
+Opus subagents need arbitration: if a hook replies ARBITRATION_REQUIRED or ARBITRATION_CANDIDATE, launch the opus-judge agent in the foreground with the short prompt the hook gives (ARBITRATION-PACKET request_id=…), then follow its ARBITRATION_DECISION (CONTINUE/RETRY at most once/STOP without Opus; ESCALATE: issue exactly the granted call). Never retry an Opus call directly, never launch opus-judge without a packet, and never use background or nested Opus agents.
+In strict mode, Opus subagents are denied; use sonnet or haiku.
+A request_id is correlation only, not permission. In unattended runs, record ARBITRATION_FAILED/STOP/QUOTA outcomes as unresolved and continue other safe steps.

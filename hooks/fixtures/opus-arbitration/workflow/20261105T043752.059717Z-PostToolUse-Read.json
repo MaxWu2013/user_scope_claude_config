@@ -1,0 +1,30 @@
+{
+  "session_id": "65e588b4-e3a4-47dd-9a68-d228230f4c27",
+  "transcript_path": "/Users/wujincheng/.claude/projects/-private-tmp-router-v2-probe/65e588b4-e3a4-47dd-9a68-d228230f4c27.jsonl",
+  "cwd": "/private/tmp/router-v2-probe",
+  "prompt_id": "5ac16f1c-7cdb-4dc9-90a0-147d4b92fed6",
+  "permission_mode": "default",
+  "agent_id": "a7f28682f32f408be",
+  "agent_type": "workflow-subagent",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Read",
+  "tool_input": {
+    "file_path": "/tmp/router-v2-probe/README.md",
+    "limit": 1
+  },
+  "tool_response": {
+    "type": "text",
+    "file": {
+      "filePath": "/tmp/router-v2-probe/README.md",
+      "content": "Disposable probe project for router v2; safe to delete.",
+      "numLines": 1,
+      "startLine": 1,
+      "totalLines": 2
+    }
+  },
+  "tool_use_id": "toolu_014iVjeaUSCZB5x7hG3jETqT",
+  "duration_ms": 1
+}
