@@ -33,7 +33,7 @@
     "require_mod_call_attestation": true
   },
   "planning": {
-    "enabled": false,
+    "enabled": true,
     "planner_agent_type": "opus-planner",
     "max_plan_versions_per_task": 3,
     "max_replans_per_task": 2,
