@@ -1,7 +1,10 @@
 {
   "env": {
     "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet",
-    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1"
+    "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH": "1",
+    "CLAUDE_CODE_WORKFLOW_SUBAGENT_MODEL": "sonnet",
+    "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS": "4",
+    "CLAUDE_CODE_PLUGIN_DIRS": "/Users/wujincheng/.claude/mods/opus-workflow-spawn"
   },
   "hooks": {
     "Notification": [
@@ -62,6 +65,18 @@
           }
         ]
       }
+      ,
+      {
+        "matcher": "Agent|SendMessage|Bash|Workflow",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/opus-arbitration-post.py\"",
+            "onFailure": "continue",
+            "timeout": 10
+          }
+        ]
+      }
     ],
     "PostToolUseFailure": [
       {
@@ -70,6 +85,18 @@
           {
             "type": "command",
             "command": "python3 \"$HOME/.claude/hooks/bin/control-check\""
+          }
+        ]
+      }
+      ,
+      {
+        "matcher": "Agent|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/opus-arbitration-post.py\"",
+            "onFailure": "continue",
+            "timeout": 10
           }
         ]
       }
@@ -123,6 +150,28 @@
           }
         ]
       }
+      ,
+      {
+        "matcher": "Agent|Task|SendMessage|Workflow|Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/opus-arbitration-gate.py\"",
+            "onFailure": "block",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/opus-workflow-guard.py\"",
+            "onFailure": "block",
+            "timeout": 5
+          }
+        ]
+      }
     ],
     "SessionEnd": [
       {
@@ -173,12 +222,34 @@
         ]
       }
     ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/opus-workflow-guard.py\"",
+            "onFailure": "continue",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "SubagentStop": [
       {
         "hooks": [
           {
             "type": "command",
             "command": "/Users/wujincheng/.config/iterm2/cc-status"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.claude/hooks/opus-workflow-guard.py\"",
+            "onFailure": "continue",
+            "timeout": 5
           }
         ]
       }
@@ -207,5 +278,8 @@
     }
   },
   "theme": "dark",
-  "model": "opus"
+  "model": "opus",
+  "permissions": {
+    "defaultMode": "plan"
+  }
 }
