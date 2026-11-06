@@ -591,6 +591,7 @@ def make_cases(
             expected_exit_only(0),
         ),
         *skill_config_cases(skill_home, skill_project, skill_log_dir),
+        *data_class_cases(),
     ]
 
 
@@ -682,6 +683,84 @@ def skill_config_cases(skill_home: Path, skill_project: Path, skill_log_dir: Pat
             0,
             unwritable_check,
             env=env_for(bad_log),
+        ),
+    ]
+
+
+def data_class_cases() -> List[Case]:
+    home = os.path.expanduser("~")
+    root = os.path.join(home, "workplace", "OlaChat", "InfoTank", "data")
+    allowed = os.path.join(root, "foo", "source.json")
+    return [
+        Case(
+            68,
+            "Write InfoTank data/foo/source.json",
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": allowed},
+            },
+            0,
+            expected_exit_only(0),
+        ),
+        Case(69, "Edit InfoTank data/foo/source.json", edit_payload(allowed), 0, expected_exit_only(0)),
+        Case(
+            70,
+            "Write InfoTank data/foo/bar.json",
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": os.path.join(root, "foo", "bar.json")},
+            },
+            2,
+            expected_exit_only(2),
+        ),
+        Case(
+            71,
+            "Write InfoTank data/source.json",
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": os.path.join(root, "source.json")},
+            },
+            2,
+            expected_exit_only(2),
+        ),
+        Case(
+            72,
+            "Write InfoTank data/a/b/source.json",
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": os.path.join(root, "a", "b", "source.json")},
+            },
+            2,
+            expected_exit_only(2),
+        ),
+        Case(
+            73,
+            "Write InfoTank data/../x/source.json",
+            {
+                "tool_name": "Write",
+                "tool_input": {"file_path": os.path.join(root, "..", "x", "source.json")},
+            },
+            2,
+            expected_exit_only(2),
+        ),
+        Case(
+            74,
+            "Write OtherRepo data/foo/source.json",
+            {
+                "tool_name": "Write",
+                "tool_input": {
+                    "file_path": os.path.join(home, "workplace", "OtherRepo", "data", "foo", "source.json"),
+                },
+            },
+            2,
+            expected_exit_only(2),
+        ),
+        Case(
+            75,
+            "Bash redirect to InfoTank data/foo/source.json",
+            bash_payload("echo {} > %s" % allowed),
+            2,
+            expected_exit_only(2),
         ),
     ]
 
@@ -800,7 +879,7 @@ def main() -> int:
     cleanup_ok = fixture_removed and not remaining_markers
     print(f"Tally: {case_count - case_failures} passed, {case_failures} failed")
     print(f"Cleanup: {'PASS' if cleanup_ok else 'FAIL'}")
-    return 0 if case_count == 67 and case_failures == 0 and cleanup_ok else 1
+    return 0 if case_count == 75 and case_failures == 0 and cleanup_ok else 1
 
 
 if __name__ == "__main__":

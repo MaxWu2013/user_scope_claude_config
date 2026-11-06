@@ -240,11 +240,44 @@ test('an admitted workflow spawn is logged as allow', async ($, on) => {
     runId: 'wf_allow',
     agentIndex: 2,
     agentId: 'worker-allow',
+    agentType: 'general-purpose',
     model_requested: 'opus',
     model_forced: 'sonnet',
     decision: 'allow',
   })
   expect(typeof lines[0]?.ts).toBe('string')
+})
+
+test('workflow spawn of opus-planner or opus-judge is denied and not counted', async ($, on) => {
+  mock.env(on, { HOME })
+  on('session.id', async () => ({ value: 'sess-control-agent' }))
+  on('fs.read', async () => ({ value: policyText(1, 30) }))
+  const writes = captureWrites(on)
+  let nexts = 0
+  on('agent.spawn', async (_$, event) => {
+    nexts += 1
+    return { model: event.model ?? 'sonnet', agentId: 'worker-after-control' }
+  })
+  const reason =
+    'WORKFLOW_CONTROL_AGENT_DENIED agent_type=%s: planner and judge run only through arbitration from the main session.'
+  for (const agentType of ['opus-planner', 'opus-judge'] as const) {
+    const input = workflow('wf_control', 1, 'opus')
+    input.subagentType = agentType
+    const denied = await $.agent.spawn(input)
+    expect(denied.deny).toBe(reason.replace('%s', agentType))
+  }
+  const admitted = await $.agent.spawn(workflow('wf_control', 2))
+  expect(admitted.agentId).toBe('worker-after-control')
+  expect(nexts).toBe(1)
+  const lines = spawnLog(writes, 'sess-control-agent')
+  expect(lines.map(line => line.decision)).toEqual(['deny', 'deny', 'allow'])
+  expect(lines[0]).toMatchObject({
+    agentType: 'opus-planner',
+    decision: 'deny',
+    reason: reason.replace('%s', 'opus-planner'),
+  })
+  expect(lines[1]?.agentType).toBe('opus-judge')
+  expect(lines[2]).toMatchObject({ agentType: 'general-purpose', decision: 'allow', agentId: 'worker-after-control' })
 })
 
 test('a cap denial is logged as deny and the admitted spawn stays allow', async ($, on) => {

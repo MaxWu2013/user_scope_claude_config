@@ -1311,8 +1311,8 @@ def model_id_from_transcript_head(blob):
     return None
 
 
-def read_worker_model_id(path):
-    """Model id from the first 256 KiB of a regular worker transcript."""
+def _read_transcript_head(path):
+    """First 256 KiB of a regular transcript, or None."""
     if not isinstance(path, str) or path == "":
         return None
     try:
@@ -1327,12 +1327,45 @@ def read_worker_model_id(path):
         return None
     try:
         try:
-            blob = os.read(fd, _TRANSCRIPT_CAP)
+            return os.read(fd, _TRANSCRIPT_CAP)
         except OSError:
             return None
     finally:
         os.close(fd)
+
+
+def read_worker_model_id(path):
+    """Model id from the first 256 KiB of a regular worker transcript."""
+    blob = _read_transcript_head(path)
+    if blob is None:
+        return None
     return model_id_from_transcript_head(blob)
+
+
+def read_worker_query_agent(path):
+    """Definition name from querySource agent:custom:<name>, else None."""
+    blob = _read_transcript_head(path)
+    if blob is None:
+        return None
+    text = bytes(blob).decode("utf-8", errors="replace")
+    prefix = "agent:custom:"
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "" or stripped[0] != "{":
+            continue
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        source = obj.get("querySource")
+        if not isinstance(source, str) or not source.startswith(prefix):
+            continue
+        name = source[len(prefix):].strip()
+        if name and "/" not in name and "\\" not in name and ".." not in name:
+            return name
+    return None
 
 
 def model_family(text):

@@ -17,6 +17,21 @@ type SpawnEvent = {
   workflow?: { runId: string; agentIndex: number }
   resume?: { agentId: string }
   model?: string
+  subagentType?: string
+}
+
+const CONTROL_AGENTS = new Set(['opus-planner', 'opus-judge'])
+
+function spawnAgentType(event: SpawnEvent): string | null {
+  const value = event.subagentType
+  return typeof value === 'string' && value !== '' ? value : null
+}
+
+function controlDenyReason(agentType: string): string {
+  return (
+    `WORKFLOW_CONTROL_AGENT_DENIED agent_type=${agentType}: ` +
+    'planner and judge run only through arbitration from the main session.'
+  )
 }
 
 const trackedIds = new Set<string>()
@@ -162,6 +177,7 @@ async function logDeny($: EngineInterface, event: SpawnEvent, reason: string): P
         session_id: await $.session.id(),
         runId: event.workflow?.runId ?? '',
         agentIndex: event.workflow?.agentIndex ?? 0,
+        agentType: spawnAgentType(event),
         decision: 'deny',
         reason,
         ts: new Date().toISOString(),
@@ -226,6 +242,13 @@ export const register: Register = on => {
       return { deny: 'WORKFLOW_RESUME_DENIED' }
     }
 
+    const agentType = spawnAgentType(event)
+    if (agentType !== null && CONTROL_AGENTS.has(agentType)) {
+      const reason = controlDenyReason(agentType)
+      await logDeny($, event, reason)
+      return { deny: reason }
+    }
+
     const policy = await loadPolicy($)
     if (policy === null) {
       await logDeny($, event, 'OPUS_SPAWN_POLICY_UNAVAILABLE')
@@ -259,6 +282,7 @@ export const register: Register = on => {
           runId,
           agentIndex: event.workflow?.agentIndex ?? 0,
           agentId,
+          agentType: spawnAgentType(event),
           model_requested: event.model ?? null,
           model_forced: policy.workerModel,
           decision: 'allow',

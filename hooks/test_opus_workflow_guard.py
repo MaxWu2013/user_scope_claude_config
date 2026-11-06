@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 import test_opus_arbitration as base
 
 GUARD = ROOT / "opus-workflow-guard.py"
+POST = ROOT / "opus-arbitration-post.py"
 WF = base.FIXTURES / "workflow"
 DELEGATION = (
     "WORKFLOW_WORKER_NO_DELEGATION; report NEEDS_JUDGMENT in your status footer instead, "
@@ -23,6 +24,25 @@ DELEGATION = (
     "report NEEDS_JUDGMENT with reason_code PLAN_REVISION_REQUIRED, the stage_id, a narrow "
     "unresolved_question and evidence_refs, then stop. Do not delegate."
 )
+
+
+def _control_reason(agent_type):
+    return (
+        "WORKFLOW_CONTROL_AGENT_DENIED agent_type=%s: "
+        "planner and judge run only through arbitration from the main session."
+        % agent_type
+    )
+
+
+def _events(world):
+    path = world.home / ".claude" / "logs" / "opus-arbitration" / "events.jsonl"
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+    return rows
 
 
 def run_guard(world, payload, extra=None):
@@ -38,14 +58,32 @@ def run_guard(world, payload, extra=None):
     )
 
 
+def run_post(world, payload):
+    return subprocess.run(
+        [sys.executable, str(POST)],
+        input=payload if isinstance(payload, str) else json.dumps(payload),
+        text=True,
+        capture_output=True,
+        env=world.env(),
+        cwd=str(world.project),
+        timeout=30,
+        check=False,
+    )
+
+
 def load_workflow(name):
     return json.loads((WF / name).read_text(encoding="utf-8"))
 
 
-def write_transcript(world, session_id, agent_id, model_id=None, fallback=None):
+def write_transcript(world, session_id, agent_id, model_id=None, fallback=None, query_source=None):
     folder = world.home / ".claude" / "projects" / "demo" / session_id / "subagents" / "workflows" / "wf_1"
     folder.mkdir(parents=True, exist_ok=True)
     lines = [json.dumps({"type": "system", "content": "boot"})]
+    if query_source:
+        lines.append(json.dumps({
+            "type": "api-request",
+            "querySource": "agent:custom:%s" % query_source,
+        }))
     if model_id:
         lines.append(json.dumps({
             "type": "attachment",
@@ -605,7 +643,7 @@ def test_custom_workers(suite):
         )
         sonnet_read = worker_read(world, session_id, planner_id, transcript, prompt_id)
         sonnet_read["agent_type"] = "opus-planner"
-        sonnet_ok = run_guard(world, sonnet_read)
+        sonnet_kind, sonnet_reason = base.verdict(run_guard(world, sonnet_read))
         bash = worker_read(world, session_id, planner_id, transcript, prompt_id)
         bash["agent_type"] = "opus-planner"
         bash["tool_name"] = "Bash"
@@ -613,10 +651,11 @@ def test_custom_workers(suite):
         bash_kind, bash_reason = base.verdict(run_guard(world, bash))
         suite.check(
             "CW",
-            "an opus-planner worker is model-checked and still role-denied",
-            sonnet_ok.returncode == 0 and sonnet_ok.stdout == ""
+            "an opus-planner worker read is denied and bash stays a role deny",
+            sonnet_kind == "deny"
+            and sonnet_reason == _control_reason("opus-planner")
             and bash_kind == "deny" and bash_reason == "OPUS_ROLE_TOOL_DENIED Bash",
-            "read=%r bash=%s %s" % (sonnet_ok.stdout[:80], bash_kind, bash_reason[:120]),
+            "read=%s %s bash=%s %s" % (sonnet_kind, sonnet_reason[:80], bash_kind, bash_reason[:80]),
         )
         opus_id = "a38ac8d2ba2cf33e8"
         write_transcript(world, session_id, opus_id, "claude-opus-5-5")
@@ -697,12 +736,255 @@ def test_custom_workers(suite):
         world.close()
 
 
+def test_control_agent_workers(suite):
+    """Planner and judge workers are denied. Other worker types stay on the old rules."""
+    world = base.World()
+    try:
+        session_id = "sess-control"
+        prompt_id = "prompt-control"
+        launch_workflow(world, session_id, prompt_id)
+        planner_id = "a03f0a6a7e367f269"
+        judge_id = "a1111111111111111"
+        general_id = "a2222222222222222"
+        writer_id = "a80787e3ee8867093"
+        transcript, planner_path = write_transcript(
+            world, session_id, planner_id, "claude-sonnet-5-5",
+        )
+        write_transcript(world, session_id, judge_id, "claude-sonnet-5-5", query_source="opus-judge")
+        write_transcript(world, session_id, general_id, "claude-sonnet-5-5")
+        write_transcript(world, session_id, writer_id, "claude-sonnet-5-5")
+        start_worker(world, session_id, planner_id, prompt_id, transcript, agent_type="opus-planner")
+        start_worker(world, session_id, judge_id, prompt_id, transcript, agent_type="workflow-subagent")
+        start_worker(world, session_id, general_id, prompt_id, transcript, agent_type="general-purpose")
+        start_worker(world, session_id, writer_id, prompt_id, transcript, agent_type="file-writer")
+        started = [
+            row for row in _events(world)
+            if row.get("event") == "workflow_worker_started" and row.get("session_id") == session_id
+        ]
+        by_agent = {row.get("agent_id"): row for row in started}
+        suite.check(
+            "CA",
+            "workflow_worker_started carries agent_type and the resolved model",
+            by_agent.get(planner_id, {}).get("agent_type") == "opus-planner"
+            and by_agent.get(planner_id, {}).get("resolved_model") == "claude-sonnet-5-5"
+            and by_agent.get(judge_id, {}).get("agent_type") == "opus-judge"
+            and by_agent.get(general_id, {}).get("agent_type") == "general-purpose"
+            and by_agent.get(writer_id, {}).get("agent_type") == "file-writer",
+            "events=%s" % [
+                (row.get("agent_id"), row.get("agent_type"), row.get("resolved_model"))
+                for row in started
+            ],
+        )
+        denied = []
+        for agent_type, agent_id, expected in (
+            ("opus-planner", planner_id, _control_reason("opus-planner")),
+            ("opus-judge", judge_id, _control_reason("opus-judge")),
+        ):
+            payload = worker_read(world, session_id, agent_id, transcript, prompt_id)
+            payload["agent_type"] = agent_type
+            kind, reason = base.verdict(run_guard(world, payload))
+            if kind != "deny" or reason != expected:
+                denied.append("%s %s %s" % (agent_type, kind, reason[:80]))
+        suite.check(
+            "CA",
+            "opus-planner and opus-judge workers are denied",
+            denied == [],
+            "; ".join(denied),
+        )
+        # The judge payload above names the type. A workflow-subagent whose
+        # transcript querySource is agent:custom:opus-judge is the same deny.
+        hidden = worker_read(world, session_id, judge_id, transcript, prompt_id)
+        hidden["agent_type"] = "workflow-subagent"
+        hidden["tool_use_id"] = "judge-hidden"
+        hidden_kind, hidden_reason = base.verdict(run_guard(world, hidden))
+        suite.check(
+            "CA",
+            "querySource agent:custom:opus-judge denies a generic worker",
+            hidden_kind == "deny" and hidden_reason == _control_reason("opus-judge"),
+            "%s %s" % (hidden_kind, hidden_reason[:120]),
+        )
+        allowed = []
+        for agent_type, agent_id in (("general-purpose", general_id), ("file-writer", writer_id)):
+            payload = worker_read(world, session_id, agent_id, transcript, prompt_id)
+            payload["agent_type"] = agent_type
+            payload["tool_use_id"] = "read-" + agent_type
+            proc = run_guard(world, payload)
+            if proc.returncode != 0 or proc.stdout != "":
+                allowed.append("%s %s %r" % (agent_type, proc.returncode, proc.stdout[:80]))
+        suite.check(
+            "CA",
+            "general-purpose and file-writer workers still read",
+            allowed == [],
+            "; ".join(allowed),
+        )
+        footer = {
+            "schema_version": 1,
+            "task_id": "wf-task",
+            "status": "NEEDS_JUDGMENT",
+            "reason_code": "NEEDS_OPUS",
+            "unresolved": ["the hard part"],
+            "attempts": [{"strategy_digest": "abc", "outcome": "failed"}],
+        }
+        stop = load_workflow("20261105T043812.562702Z-SubagentStop-none.json")
+        stop["session_id"] = session_id
+        stop["cwd"] = str(world.project)
+        stop["transcript_path"] = str(transcript)
+        stop["agent_id"] = planner_id
+        stop["agent_type"] = "opus-planner"
+        stop["prompt_id"] = prompt_id
+        stop["agent_transcript_path"] = str(planner_path)
+        stop["last_assistant_message"] = json.dumps(footer)
+        stopped = run_guard(world, stop)
+        pending = [
+            row for row in base.rows(world, "requests")
+            if row.get("session_id") == session_id
+        ]
+        denied_events = [
+            row for row in _events(world)
+            if row.get("event") == "workflow_control_agent_denied"
+            and row.get("agent_id") == planner_id
+        ]
+        suite.check(
+            "CA",
+            "planner worker stop records the deny and is not a plan",
+            stopped.returncode == 0 and stopped.stdout == ""
+            and pending == []
+            and len(denied_events) == 1
+            and denied_events[0].get("agent_type") == "opus-planner",
+            "code=%s pending=%s events=%s" % (stopped.returncode, pending, denied_events),
+        )
+        posted = run_post(world, {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Agent",
+            "session_id": session_id,
+            "cwd": str(world.project),
+            "transcript_path": str(transcript),
+            "tool_use_id": "post-planner",
+            "tool_response": {
+                "status": "completed",
+                "agentId": planner_id,
+                "agentType": "opus-planner",
+                "resolvedModel": "claude-sonnet-5-5",
+                "content": [{"type": "text", "text": "{}"}],
+            },
+        })
+        denied_again = [
+            row for row in _events(world)
+            if row.get("event") == "workflow_control_agent_denied"
+            and row.get("agent_id") == planner_id
+        ]
+        suite.check(
+            "CA",
+            "guard stop and the post hook record one denial",
+            posted.returncode == 0 and posted.stdout == "" and len(denied_again) == 1,
+            "code=%s stdout=%r events=%s" % (posted.returncode, posted.stdout[:160], denied_again),
+        )
+
+        opus_id = "a4444444444444444"
+        _opus_main, opus_path = write_transcript(
+            world, session_id, opus_id, "claude-opus-5-5", query_source="opus-planner",
+        )
+        start_worker(world, session_id, opus_id, prompt_id, transcript, agent_type="opus-planner")
+        opus_stop = load_workflow("20261105T043812.562702Z-SubagentStop-none.json")
+        opus_stop["session_id"] = session_id
+        opus_stop["cwd"] = str(world.project)
+        opus_stop["transcript_path"] = str(transcript)
+        opus_stop["agent_id"] = opus_id
+        opus_stop["agent_type"] = "opus-planner"
+        opus_stop["prompt_id"] = prompt_id
+        opus_stop["agent_transcript_path"] = str(opus_path)
+        opus_stop["last_assistant_message"] = json.dumps(footer)
+        opus_stopped = run_guard(world, opus_stop)
+        opus_denied = [
+            row for row in _events(world)
+            if row.get("event") == "workflow_control_agent_denied"
+            and row.get("agent_id") == opus_id
+        ]
+        opus_events = [
+            row for row in _events(world)
+            if row.get("event") == "unarbitrated_opus_run"
+            and row.get("agent_id") == opus_id
+        ]
+        opus_pending = [
+            row for row in base.rows(world, "requests")
+            if row.get("session_id") == session_id
+        ]
+        suite.check(
+            "CA",
+            "an opus control-agent stop is not an Opus event",
+            opus_stopped.returncode == 0 and opus_stopped.stdout == ""
+            and len(opus_denied) == 1
+            and opus_events == []
+            and opus_pending == [],
+            "code=%s denied=%s opus=%s pending=%s" % (
+                opus_stopped.returncode, opus_denied, opus_events, opus_pending,
+            ),
+        )
+
+        masked_id = "a3333333333333333"
+        write_transcript(
+            world, session_id, masked_id, "claude-sonnet-5-5", query_source="opus-planner",
+        )
+        start_worker(world, session_id, masked_id, prompt_id, transcript, agent_type="file-writer")
+        masked = worker_read(world, session_id, masked_id, transcript, prompt_id)
+        masked["agent_type"] = "file-writer"
+        masked["tool_use_id"] = "masked-planner"
+        masked_kind, masked_reason = base.verdict(run_guard(world, masked))
+        suite.check(
+            "CA",
+            "querySource opus-planner denies a file-writer hook name",
+            masked_kind == "deny" and masked_reason == _control_reason("opus-planner"),
+            "%s %s" % (masked_kind, masked_reason[:160]),
+        )
+    finally:
+        world.close()
+
+
+def test_query_source_cache(suite):
+    """The transcript querySource is read once per worker."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("opus_workflow_guard_cache", GUARD)
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    calls = {"n": 0}
+    answers = {}
+
+    def read_worker_query_agent(path):
+        calls["n"] += 1
+        return answers.get(path, "")
+
+    agent_model = type("AgentModel", (), {
+        "read_worker_query_agent": staticmethod(read_worker_query_agent),
+        "find_workflow_transcript": staticmethod(lambda *_args: None),
+    })()
+    first = {"agent_id": "worker-a", "agent_type": "file-writer", "agent_transcript_path": "/tmp/a.jsonl"}
+    second = {"agent_id": "worker-b", "agent_type": "general-purpose", "agent_transcript_path": "/tmp/b.jsonl"}
+    answers["/tmp/a.jsonl"] = "opus-planner"
+    answers["/tmp/b.jsonl"] = "opus-judge"
+    seen = [
+        guard._control_agent_name(agent_model, first),
+        guard._control_agent_name(agent_model, first),
+        guard._control_agent_name(agent_model, second),
+        guard._control_agent_name(agent_model, first),
+    ]
+    suite.check(
+        "CA",
+        "querySource is cached per worker and the stricter name wins",
+        seen == ["opus-planner", "opus-planner", "opus-judge", "opus-planner"]
+        and calls["n"] == 2,
+        "seen=%s reads=%s" % (seen, calls["n"]),
+    )
+
+
 def main():
     suite = base.Suite()
     test_guard(suite)
     test_role_tools(suite)
     test_replan_surface(suite)
     test_custom_workers(suite)
+    test_control_agent_workers(suite)
+    test_query_source_cache(suite)
     print("Tally: %s passed, %s failed" % (suite.passed, suite.failed))
     if suite.failures:
         print("\n".join(suite.failures))

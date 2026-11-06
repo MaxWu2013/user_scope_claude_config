@@ -175,6 +175,126 @@ def _decision_text(result, payload=None):
     return ""
 
 
+_CONTROL_AGENTS = frozenset({"opus-planner", "opus-judge"})
+_WORKFLOW_PARENT_KEYS = frozenset({
+    "workflow",
+    "workflowRunId",
+    "workflow_run_id",
+    "spawnedByWorkflowRunId",
+    "spawned_by_workflow_run_id",
+})
+_PARENT_NAME_KEYS = frozenset({"parent", "caller", "parentTool", "parent_tool"})
+_PARENT_TOOL_KEYS = frozenset({
+    "parentTool",
+    "parent_tool",
+    "parentToolName",
+    "parent_tool_name",
+})
+_PATH_KEYS = frozenset({
+    "agent_transcript_path",
+    "agentTranscriptPath",
+    "transcriptPath",
+    "transcript_path",
+    "transcriptDir",
+})
+
+
+def _under_workflows(path):
+    """True when a path sits under a subagents/workflows directory."""
+    if not isinstance(path, str) or path.strip() == "":
+        return False
+    parts = os.path.normpath(path).split(os.sep)
+    for index in range(len(parts) - 1):
+        if parts[index] == "subagents" and parts[index + 1] == "workflows":
+            return True
+    return False
+
+
+def _names_workflow(value):
+    if isinstance(value, str):
+        return value.strip() == "Workflow"
+    if not isinstance(value, dict):
+        return False
+    for field in ("type", "tool", "name", "tool_name", "toolName"):
+        shown = value.get(field)
+        if isinstance(shown, str) and shown.strip() == "Workflow":
+            return True
+    return False
+
+
+def _workflow_parent(obj):
+    """True when a tool input or response shows a Workflow parent.
+
+    Free-text fields such as content are not scanned. A plan that mentions
+    a workflow path stays a main-session plan.
+    """
+    if not isinstance(obj, dict):
+        return False
+    for key, value in obj.items():
+        if key in _WORKFLOW_PARENT_KEYS:
+            if isinstance(value, str) and value.strip():
+                return True
+            if isinstance(value, dict) and value:
+                return True
+        if key in _PARENT_NAME_KEYS and _names_workflow(value):
+            return True
+        if key in _PARENT_TOOL_KEYS and isinstance(value, str) and value.strip() == "Workflow":
+            return True
+        if key in _PATH_KEYS and _under_workflows(value):
+            return True
+    return False
+
+
+def _workflow_transcript(payload, agent_id):
+    """Worker transcript under subagents/workflows, else empty."""
+    for key in ("agent_transcript_path", "transcript_path"):
+        path = payload.get(key)
+        if _under_workflows(path):
+            return path
+    try:
+        import _agent_model as agent_model
+        found = agent_model.find_workflow_transcript(
+            payload.get("transcript_path"),
+            payload.get("session_id"),
+            agent_id,
+        )
+    except Exception:
+        return ""
+    if isinstance(found, str) and found:
+        return found
+    return ""
+
+
+def _workflow_control_agent(payload):
+    """(agent_id, agent_type) when this result is a workflow planner or judge.
+
+    A ledger workflow_worker row is enough. So is lineage when that row is
+    missing: the tool or response shows a Workflow parent, or the worker
+    transcript is under subagents/workflows/. A planner or judge started from
+    the main session has neither, and still ingests.
+    """
+    response = _response(payload)
+    agent_type = response.get("agentType") if isinstance(response.get("agentType"), str) else ""
+    agent_type = agent_type.strip()
+    if agent_type not in _CONTROL_AGENTS:
+        return None
+    agent_id = response.get("agentId")
+    if not isinstance(agent_id, str) or agent_id.strip() == "":
+        return None
+    agent_id = agent_id.strip()
+    try:
+        row = arb.workflow_worker_row(agent_id)
+    except Exception:
+        row = None
+    if isinstance(row, dict) and row.get("kind") == "workflow_worker":
+        return agent_id, agent_type
+    if _workflow_parent(_tool_input(payload)) or _workflow_parent(response):
+        return agent_id, agent_type
+    if _workflow_transcript(payload, agent_id):
+        return agent_id, agent_type
+    return None
+
+
 def _is_judge(payload):
     response = _response(payload)
     policy = arb.load_policy()
@@ -274,6 +394,19 @@ def _handle(payload):
     if event_name == "PostToolUseFailure":
         if not _inside(payload):
             arb.note_agent_failure(payload)
+        return 0
+    control = _workflow_control_agent(payload)
+    if control:
+        agent_id, agent_type = control
+        try:
+            arb.record_workflow_control_denial(
+                _session(payload),
+                arb.project_of(payload),
+                agent_id,
+                agent_type,
+            )
+        except Exception:
+            pass
         return 0
     recorded = arb.record_agent_result(payload)
     alert = ""

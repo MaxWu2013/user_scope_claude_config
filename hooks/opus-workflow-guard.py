@@ -15,6 +15,8 @@ import os
 import sys
 
 _DELEGATION = frozenset({"Agent", "Task", "SendMessage", "Workflow", "Skill"})
+_CONTROL_AGENTS = frozenset({"opus-planner", "opus-judge"})
+_GENERIC_AGENT_TYPES = frozenset({"", "workflow-subagent"})
 _TRIVIAL_TOOLS = frozenset({
     "Read",
     "Grep",
@@ -281,6 +283,107 @@ def _modules():
     return agent_model, arbitration
 
 
+def _specific_agent_type(data):
+    """Hook agent_type when it names a definition, else empty.
+
+    workflow-subagent is the generic worker marker, not a definition name.
+    """
+    if not isinstance(data, dict):
+        return ""
+    raw = data.get("agent_type")
+    if not isinstance(raw, str):
+        return ""
+    name = raw.strip()
+    if name in _GENERIC_AGENT_TYPES:
+        return ""
+    return name
+
+
+def _query_source_agent(agent_model, data):
+    """Definition name from the worker transcript querySource, else empty."""
+    path = data.get("agent_transcript_path")
+    if isinstance(path, str) and path.strip():
+        found = agent_model.read_worker_query_agent(path)
+        if isinstance(found, str) and found:
+            return found
+    located = agent_model.find_workflow_transcript(
+        data.get("transcript_path"),
+        data.get("session_id"),
+        data.get("agent_id"),
+    )
+    if not isinstance(located, str) or located == "":
+        return ""
+    found = agent_model.read_worker_query_agent(located)
+    return found if isinstance(found, str) else ""
+
+
+def _cached_query_source(agent_model, data):
+    """querySource name for this worker. One transcript read per worker."""
+    agent_id = ""
+    if isinstance(data, dict):
+        raw = data.get("agent_id")
+        if isinstance(raw, str):
+            agent_id = raw.strip()
+    memo = getattr(_cached_query_source, "memo", None)
+    if memo is None:
+        memo = {}
+        _cached_query_source.memo = memo
+    if agent_id and agent_id in memo:
+        return memo[agent_id]
+    try:
+        found = _query_source_agent(agent_model, data)
+    except Exception:
+        found = ""
+    if not isinstance(found, str):
+        found = ""
+    if agent_id:
+        memo[agent_id] = found
+    return found
+
+
+def _recorded_agent_type(agent_model, data):
+    """Best agent type to store: hook field, else transcript querySource."""
+    named = _specific_agent_type(data)
+    if named:
+        return named
+    found = _cached_query_source(agent_model, data)
+    if found:
+        return found
+    raw = data.get("agent_type") if isinstance(data, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return ""
+
+
+def _control_agent_name(agent_model, data, row=None):
+    """opus-planner or opus-judge when this worker is one of those definitions.
+
+    A specific hook agent_type that is not a control agent still loses to a
+    transcript querySource of opus-planner or opus-judge.
+    """
+    named = _specific_agent_type(data)
+    if named in _CONTROL_AGENTS:
+        return named
+    found = _cached_query_source(agent_model, data)
+    if found in _CONTROL_AGENTS:
+        return found
+    if named:
+        return ""
+    if isinstance(row, dict):
+        stored = row.get("agent_type")
+        if isinstance(stored, str) and stored.strip() in _CONTROL_AGENTS:
+            return stored.strip()
+    return ""
+
+
+def _control_reason(agent_type):
+    return (
+        "WORKFLOW_CONTROL_AGENT_DENIED agent_type=%s: "
+        "planner and judge run only through arbitration from the main session."
+        % agent_type
+    )
+
+
 def _worker_model(agent_model, data, direct_path):
     path = direct_path
     if not isinstance(path, str) or path == "":
@@ -361,13 +464,32 @@ def _unarbitrated_spawn(arb, data):
         pass
 
 
-def _start(arb, data):
+def _start(agent_model, arb, data):
     session_id = data.get("session_id") if isinstance(data.get("session_id"), str) else ""
     agent_id = data.get("agent_id") if isinstance(data.get("agent_id"), str) else ""
     if not _mod_spawned(session_id, agent_id):
         _unarbitrated_spawn(arb, data)
-    arb.record_workflow_worker(data)
+    recorded = dict(data)
+    agent_type = _recorded_agent_type(agent_model, data)
+    if agent_type:
+        recorded["agent_type"] = agent_type
+    model_id = _worker_model(agent_model, data, data.get("agent_transcript_path"))
+    arb.record_workflow_worker(recorded, model_id)
     return 0
+
+
+def _record_control_denial(arb, data, agent_id, agent_type, model_id):
+    session_id = data.get("session_id") if isinstance(data.get("session_id"), str) else ""
+    try:
+        arb.record_workflow_control_denial(
+            session_id,
+            arb.project_of(data),
+            agent_id,
+            agent_type,
+            model_id if isinstance(model_id, str) and model_id else None,
+        )
+    except Exception:
+        return
 
 
 def _stop(agent_model, arb, data):
@@ -379,6 +501,17 @@ def _stop(agent_model, arb, data):
             arb.set_worker_model(agent_id, model_id, family, "stopped")
         else:
             arb.set_worker_model(agent_id, "", family, "stopped")
+    row = None
+    if agent_id:
+        try:
+            row = arb.workflow_worker_row(agent_id)
+        except Exception:
+            row = None
+    control = _control_agent_name(agent_model, data, row)
+    if control:
+        # A denied control agent is not an Opus event and opens no candidate.
+        _record_control_denial(arb, data, agent_id, control, model_id)
+        return 0
     if family == "opus":
         _opus_event(arb, data, model_id)
     arb.register_workflow_candidate(data, model_id or "")
@@ -399,6 +532,9 @@ def _worker_tool(agent_model, arb, data):
     if not _mod_spawned(session_id, agent_id):
         _unarbitrated_spawn(arb, data)
         return _deny("WORKFLOW_WORKER_NOT_MOD_SPAWNED")
+    control = _control_agent_name(agent_model, data, row)
+    if control:
+        return _deny(_control_reason(control))
     cached = row.get("verified_family")
     if isinstance(cached, str) and cached != "":
         family = cached
@@ -448,7 +584,7 @@ def _handle(data):
     if _worker_payload(data):
         event = data.get("hook_event_name")
         if event == "SubagentStart":
-            return _start(arb, data)
+            return _start(agent_model, arb, data)
         if event == "SubagentStop":
             return _stop(agent_model, arb, data)
         return _worker_tool(agent_model, arb, data)

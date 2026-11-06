@@ -14,6 +14,7 @@ export type SpawnRecord = {
   decision: 'allow' | 'deny'
   ts: string
   agentId?: string | null
+  agentType?: string | null
   model_requested?: string | null
   model_forced?: string
   reason?: string

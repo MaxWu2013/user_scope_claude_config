@@ -62,6 +62,7 @@ OBSIDIAN_READ_OPS = {
     "get_recent_changes",
 }
 OBSIDIAN_WRITE_OPS = {"put_content", "append_content", "patch_content"}
+# `data` (InfoTank source.json) is intentionally absent: silent and unlogged.
 ROUTED_WRITE_CLASSES = {"document", "vault_structured", "state"}
 READ_ALLOW_CLASSES = {"state", "control", "skill_config", "outside"}
 

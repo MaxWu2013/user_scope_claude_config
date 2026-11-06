@@ -45,7 +45,8 @@ OBSIDIAN_WRITE_TOOLS = {
 }
 ASK_CLASSES = {"control", "outside", "vault_asset"}
 ASK_REASON = "needs your approval (routing control plane / outside workspace / vault asset)."
-SILENT_ALLOW = {"state", "vault_structured", "document"}
+SILENT_ALLOW = {"state", "vault_structured", "document", "data"}
+_DATA_WRITE_TOOLS = {"Write", "Edit", "MultiEdit"}
 
 # Kept in sync with the phase 6c deny text. Built per call, not at import.
 _CURSOR_RUN_MESSAGE = """\
@@ -311,6 +312,10 @@ def decide(hook_input):
                 project = None
             append_routing_log(tool, path, session_id, project)
             return 0
+        if cls == "data":
+            if tool in _DATA_WRITE_TOOLS:
+                return 0
+            return deny()
         if cls in SILENT_ALLOW:
             return 0
         return deny()

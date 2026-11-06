@@ -3686,7 +3686,7 @@ def note_workflow_result(payload):
     return tool_use_id
 
 
-def record_workflow_worker(payload):
+def record_workflow_worker(payload, resolved_model=None):
     """Link a workflow-subagent start to the newest launched workflow. Never blocks."""
     if not isinstance(payload, dict):
         return None
@@ -3694,6 +3694,9 @@ def record_workflow_worker(payload):
     if agent_id.strip() == "":
         return None
     agent_id = agent_id.strip()
+    raw_type = payload.get("agent_type")
+    agent_type = raw_type.strip() if isinstance(raw_type, str) and raw_type.strip() else "workflow-subagent"
+    model = resolved_model.strip() if isinstance(resolved_model, str) else ""
     session_id = payload.get("session_id") if isinstance(payload.get("session_id"), str) else ""
     prompt_id = payload.get("prompt_id") if isinstance(payload.get("prompt_id"), str) else ""
     project = project_of(payload)
@@ -3722,8 +3725,8 @@ def record_workflow_worker(payload):
                         agent_id,
                         session_id,
                         project,
-                        "workflow-subagent",
-                        "",
+                        agent_type,
+                        model,
                         "workflow_worker",
                         None,
                         "",
@@ -3758,12 +3761,20 @@ def record_workflow_worker(payload):
                         "UPDATE agent_runs SET status='over_cap' WHERE agent_id=?",
                         (agent_id,),
                     )
+            extra = {
+                "agent_id": agent_id,
+                "agent_type": agent_type,
+                "workflow_id": workflow_id,
+                "over_cap": over,
+            }
+            if model:
+                extra["resolved_model"] = model
             _event(
                 conn,
                 "workflow_worker_started",
                 session_id=session_id,
                 project=project,
-                extra={"agent_id": agent_id, "workflow_id": workflow_id, "over_cap": over},
+                extra=extra,
             )
             return {"workflow_id": workflow_id, "over_cap": over, "agent_id": agent_id}
 
@@ -3774,6 +3785,45 @@ def workflow_worker_row(agent_id):
     with _db() as conn:
         row = conn.execute("SELECT * FROM agent_runs WHERE agent_id=?", (agent_id,)).fetchone()
         return dict(row) if row is not None else None
+
+
+def record_workflow_control_denial(session_id, project, agent_id, agent_type, resolved_model=None):
+    """Record workflow_control_agent_denied once per worker id.
+
+    The guard Stop path and the post hook can both see the same worker.
+    A second record for that agent_id is a no-op. Returns True when a row
+    was written.
+    """
+    if not isinstance(agent_id, str) or agent_id.strip() == "":
+        return False
+    agent_id = agent_id.strip()
+    extra = {"agent_id": agent_id}
+    if isinstance(agent_type, str) and agent_type.strip():
+        extra["agent_type"] = agent_type.strip()
+    if isinstance(resolved_model, str) and resolved_model.strip():
+        extra["resolved_model"] = resolved_model.strip()
+    with _db() as conn:
+        with _Tx(conn):
+            _sweep(conn, time.time())
+            rows = conn.execute(
+                "SELECT detail_json FROM events WHERE event=?",
+                ("workflow_control_agent_denied",),
+            ).fetchall()
+            for row in rows:
+                try:
+                    detail = json.loads(row["detail_json"] or "")
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(detail, dict) and detail.get("agent_id") == agent_id:
+                    return False
+            _event(
+                conn,
+                "workflow_control_agent_denied",
+                session_id=session_id if isinstance(session_id, str) else "",
+                project=project if isinstance(project, str) else "",
+                extra=extra,
+            )
+            return True
 
 
 def set_worker_model(agent_id, model_id, family, status=None):

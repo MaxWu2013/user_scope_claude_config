@@ -1148,6 +1148,115 @@ def test_planner_result(suite):
         world.close()
 
 
+def _workflow_agent_post(world, session_id, agent_id, transcript, tool_use_id, **response_extra):
+    posted = base.judge_result(
+        world, "req-unused", tool_use_id, "CONTINUE",
+        session_id=session_id, agent_id=agent_id, text="{}",
+        resolved_model="claude-opus-5-5", transcript=transcript,
+    )
+    posted["tool_response"]["agentType"] = "opus-planner"
+    posted["tool_response"].update(response_extra)
+    return posted
+
+
+def test_workflow_control_lineage(suite):
+    """A workflow planner is skipped without a ledger row. A main-session planner is not."""
+    import _router_plans as plan_store
+
+    world = base.World()
+    try:
+        base._enable_planning(world)
+        base._planner_file(world)
+        plan = {
+            "schema_version": 1,
+            "task_id": "lineage-task",
+            "base_plan_version": 0,
+            "objective": "Ship the plan store",
+            "assumptions": ["The ledger is local"],
+            "invariants": ["Plans are not permissions"],
+            "steps": [{
+                "id": "draft",
+                "depends_on": [],
+                "executor_role": "main",
+                "allowed_model": "main",
+                "instructions": "Write the plan file",
+                "acceptance_checks": ["The file parses"],
+                "requires_user_approval": False,
+            }],
+            "risks": ["A stale write"],
+            "handoff_notes": "Hand off to the next work package",
+        }
+        sha = plan_store.content_sha256(plan)
+        _request, _result, posted = _finish_planner(
+            world, "sess-main-plan", "tu-main-plan", json.dumps(plan),
+            "claude-opus-5-5", "a" + "7" * 16,
+        )
+        text = context_of(posted)
+        suite.check(
+            "P13",
+            "a main-session planner result is still ingested",
+            posted.returncode == 0 and text.startswith("PLANNER_PLAN_VALID task=lineage-task sha256=%s" % sha),
+            text[:300],
+        )
+
+        session_id = "sess-missing-row"
+        agent_id = "a" + "9" * 16
+        transcript = world.home / ".claude" / "projects" / "demo" / "main.jsonl"
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        if not transcript.exists():
+            transcript.write_text("{}\n", encoding="utf-8")
+        worker = (
+            transcript.parent / session_id / "subagents" / "workflows" / "wf_lineage"
+            / ("agent-%s.jsonl" % agent_id)
+        )
+        worker.parent.mkdir(parents=True, exist_ok=True)
+        worker.write_text("{}\n", encoding="utf-8")
+        missing = run_post(world, _workflow_agent_post(
+            world, session_id, agent_id, transcript, "tu-missing-row",
+        ))
+        parent_id = "a" + "2" * 16
+        parent = run_post(world, _workflow_agent_post(
+            world, session_id, parent_id, world.sonnet_transcript, "tu-workflow-parent",
+            workflow={"runId": "wf_parent"},
+        ))
+        events = [
+            json.loads(line)
+            for line in (
+                world.home / ".claude" / "logs" / "opus-arbitration" / "events.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        denied = [
+            row.get("agent_id") for row in events
+            if row.get("event") == "workflow_control_agent_denied"
+        ]
+        skipped = {agent_id, parent_id}
+        opus = [
+            row for row in events
+            if row.get("event") == "unarbitrated_opus_run"
+            and (row.get("agent_id") in skipped or row.get("agentId") in skipped)
+        ]
+        runs = [
+            row for row in base.rows(world, "agent_runs")
+            if row.get("agent_id") in (agent_id, parent_id)
+        ]
+        suite.check(
+            "P13",
+            "a workflow planner with no ledger row is skipped",
+            missing.returncode == 0 and missing.stdout == ""
+            and parent.returncode == 0 and parent.stdout == ""
+            and denied.count(agent_id) == 1
+            and denied.count(parent_id) == 1
+            and opus == []
+            and runs == [],
+            "missing=%r parent=%r denied=%s opus=%s runs=%s" % (
+                missing.stdout[:160], parent.stdout[:160], denied, opus, runs,
+            ),
+        )
+    finally:
+        world.close()
+
+
 def test_stage_result(suite):
     world = base.World()
     try:
@@ -1212,6 +1321,7 @@ def main():
     test_failed_names_and_deadline(suite)
     test_auto_escalate(suite)
     test_planner_result(suite)
+    test_workflow_control_lineage(suite)
     test_stage_result(suite)
     suite.check(
         "REF",

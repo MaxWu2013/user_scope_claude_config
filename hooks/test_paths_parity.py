@@ -10,6 +10,7 @@ The table is frozen from _paths.py at commit abce16b (2026-11-04).
 """
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -124,6 +125,22 @@ def load_paths():
     return module
 
 
+def classify_cases(paths_mod):
+    """InfoTank source.json is data. The neighbouring paths stay code."""
+    home = paths_mod.HOME
+    tank = os.path.join(home, "workplace", "OlaChat", "InfoTank", "data")
+    other = os.path.join(home, "workplace", "OtherRepo", "data", "foo", "source.json")
+    return [
+        (os.path.join(tank, "foo", "source.json"), "data"),
+        (os.path.join(tank, "foo", "bar.json"), "code"),
+        (os.path.join(tank, "source.json"), "code"),
+        (os.path.join(tank, "a", "b", "source.json"), "code"),
+        (os.path.join(tank, "..", "x", "source.json"), "code"),
+        (other, "code"),
+        (os.path.join(home, "workplace", "OlaChat", "InfoTank", "notes.json"), "code"),
+    ]
+
+
 def main():
     paths_mod = load_paths()
     rows = []
@@ -140,6 +157,13 @@ def main():
         if not ok:
             failed += 1
         rows.append((label, expected, actual, "PASS" if ok else "FAIL"))
+
+    for path, expected in classify_cases(paths_mod):
+        actual = paths_mod.classify_write_target("Write", {"file_path": path})
+        ok = actual == expected
+        if not ok:
+            failed += 1
+        rows.append((path, expected, actual, "PASS" if ok else "FAIL"))
 
     width = max(len("path"), *(len(repr(label)) for label, _, _, _ in rows))
     print(f"{'path':<{width}}  {'baseline':<10}  {'new':<10}  result")

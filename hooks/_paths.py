@@ -24,7 +24,7 @@ ASSET_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".heic", 
              ".mp3", ".m4a", ".wav", ".ogg", ".mp4", ".mov", ".webm"}
 SPEC_EXT = {".md", ".diff", ".patch", ".txt", ".json"}
 STRICTNESS = ["control", "outside", "skill_config", "vault_asset",
-              "code", "state", "vault_structured", "document"]   # strictest first
+              "code", "data", "state", "vault_structured", "document"]   # strictest first
 
 # Patterns use the literal token {P} (replaced with str.replace, never str.format)
 # and a leading ~ (replaced with HOME). No {a,b} brace patterns.
@@ -71,6 +71,11 @@ REGISTRY = {
     "state": [
         "~/.claude/projects/*/memory/**",
         "~/.claude/plans/**",
+    ],
+    # One channel segment, basename source.json. `*` is one segment; normpath
+    # has already dropped empty, "." and ".." before this match runs.
+    "data": [
+        "~/workplace/OlaChat/InfoTank/data/*/source.json",
     ],
 }
 
@@ -500,7 +505,20 @@ def resolve_routing_reads():
 
 
 def registry(cls, proj):
-    return [pattern.replace("{P}", proj).replace("~", HOME) for pattern in REGISTRY[cls]]
+    patterns = [pattern.replace("{P}", proj).replace("~", HOME) for pattern in REGISTRY[cls]]
+    if cls != "data":
+        return patterns
+    # macOS temp homes are symlinks (/var -> /private/var). The real path is
+    # classified too, and code is stricter, so the same pattern has to match it.
+    # A symlink that leaves this directory still fails the pattern and stays code.
+    real_home = os.path.realpath(HOME)
+    if real_home == HOME:
+        return patterns
+    extra = []
+    for pattern in patterns:
+        if pattern == HOME or pattern.startswith(HOME + os.sep):
+            extra.append(real_home + pattern[len(HOME):])
+    return patterns + extra
 
 
 def match(p, pattern):
@@ -707,7 +725,7 @@ def resolve_target(tool, ti):
 
 def _classify(p):
     proj = project_dir()
-    for cls in ("control", "skill_config", "state"):
+    for cls in ("control", "skill_config", "state", "data"):
         if any(match(p, g) for g in registry(cls, proj)):
             return cls
         if cls == "state" and is_spec(p, proj):
