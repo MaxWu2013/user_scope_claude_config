@@ -359,3 +359,40 @@ Workflow workers:
 ## session-cost
 
 Workflow transcripts are scanned with the rest of the session tree. `subagents/workflows/<runId>/journal.jsonl` is skipped, so it is not an agent and it does not warn "jsonl without meta.json". Each worker's parent is the workflow `runId`, and that node hangs off the main session. Arbitration cost includes `workflow_worker`. Opus workflow workers are coverage warnings even though they are classified. ccusage entries for those transcripts still join on timestamp, model, and token key; a matching fixture has zero unmatched entries. Denied workflow spawns count spawn-log records with `decision` `deny`, and the report confirms none of those records has a transcript.
+
+## v2.2: data write class and control-agent workers
+
+Status: merged into `~/.claude` main as `49e7c0d` (fast-forward from `a09bdde`) on 2026-11-06. All 18 hook suites pass in a sandbox HOME (for example `test_require_cursor_agent` 75/0, `test_opus_workflow_guard` 54/0, `test_opus_arbitration_post` 53/0, `test_paths_parity` 53/0, `test_route_tools` 394/0, `test_rollback_v21` 15/0). The spawn-mod tests pass 17/0.
+
+### `data` write class
+
+- `_paths.py` REGISTRY gains `~/workplace/OlaChat/InfoTank/data/*/source.json` (one segment only).
+- The lexical and realpath classes are both computed and the stricter wins, so `..` or a symlink out of the pattern falls back to `code`.
+- `require-cursor-agent.py` silently allows `data` for Write, Edit and MultiEdit only. Bash writes stay denied.
+- It is not a routed class in `route-tools.py`, so slack-sync writes stay silent and unlogged.
+- Why: `.json` is in CODE_EXT, so the Slack sync could not update its resume records (2026-11-05).
+
+### Control agents as Workflow workers
+
+A live recheck (run `wf_433ea278-c07`) showed a Workflow script could start `opus-planner` with a runtime-built name and no arbitration. The mod forced it to Sonnet, so there was no Opus spend, but its output looked like an arbitrated plan. Now:
+
+1. The spawn mod refuses a workflow spawn whose `subagentType` is `opus-planner` or `opus-judge`, before the worker starts: `WORKFLOW_CONTROL_AGENT_DENIED agent_type=<t>: planner and judge run only through arbitration from the main session.` Main-session Agent calls are unaffected.
+2. The worker guard denies every tool call of such a worker. It identifies the worker by hook `agent_type` or by transcript `querySource` `agent:custom:<name>`; the stricter wins and the result is cached per worker.
+3. On Stop and in the post hook, the result is recorded once as `workflow_control_agent_denied`. It is not ingested as a plan, opens no judge candidate and does not count as an Opus event. The post hook detects workflow lineage even without a ledger row.
+4. `workflow_worker_started` now records `agent_type` and `resolved_model`.
+
+### Settings
+
+On 2026-11-06 two allow-rules were removed from `~/.claude/settings.local.json` at the user's request: `mcp__mcp-obsidian__obsidian_delete_file` and `Bash(~/.claude/hooks/bin/cursor-run *)`. The `cursor-run new *` rule stays. Backup: `~/.claude/plans/backups/settings.local.json.bak-R20261106_ROUTER_V22_HANDOFF`.
+
+### Pending and rollback
+
+- **Live checks (2026-11-06):**
+  - **Edit of `InfoTank/data/scrum/source.json`:** the hook passed it; the tool's own "string not found" was the only error.
+  - **Write of `data/scrum/router-v22-livecheck.json`:** denied by `require-cursor-agent.py`, and nothing was written.
+  - **Fresh Sonnet main, Workflow `wf_3e247721-ed9`:**
+    - W1, with agentType `'op'+'us-planner'`, was refused at spawn with `WORKFLOW_CONTROL_AGENT_DENIED agent_type=opus-planner`;
+    - W2, general-purpose, ran on `claude-sonnet-5-5`.
+- The mod change alters the heartbeat hash, so open sessions need a restart.
+- Pending: T04 live.
+- Rollback: `git -C ~/.claude revert 49e7c0d`, then restart sessions.
