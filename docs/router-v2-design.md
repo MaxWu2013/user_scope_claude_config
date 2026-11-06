@@ -394,5 +394,11 @@ On 2026-11-06 two allow-rules were removed from `~/.claude/settings.local.json` 
     - W1, with agentType `'op'+'us-planner'`, was refused at spawn with `WORKFLOW_CONTROL_AGENT_DENIED agent_type=opus-planner`;
     - W2, general-purpose, ran on `claude-sonnet-5-5`.
 - The mod change alters the heartbeat hash, so open sessions need a restart.
-- Pending: T04 live.
+- **T04 live: PASS** (2026-11-06, Sonnet main session `785426c3`).
+  - `opus-planner` was denied with `ARBITRATION_REQUIRED`.
+  - The judge returned `ESCALATE` with `COUPLED_CONSTRAINT_PLANNING`, on a 40-service migration with 120 cross-service FKs and a ledger invariant, with no prior failure evidence.
+  - One grant was issued and consumed.
+  - The planner ran on `claude-opus-5-5`, and the result was `PLANNER_PLAN_VALID`.
+  - Cost from session-cost: planner $0.13, judge $0.04, main $0.25; `unarbitrated_opus_runs` 0.
+  - This corrects the earlier expectation that a fresh PLAN_REQUEST would almost always get CONTINUE: the judge does escalate genuinely coupled planning.
 - Rollback: `git -C ~/.claude revert 49e7c0d`, then restart sessions.
